@@ -1,35 +1,35 @@
 // pkg.sv
 package accel_pkg;
-    // 基本パラメータ
+    // 基本パラメータ（変更なし）
     parameter VECTOR_WIDTH = 32;
     parameter VECTOR_DEPTH = 16;
     parameter MATRIX_DEPTH = 16;
     parameter NUM_PROCESSING_UNITS = 4;
 
-    // 簡略化された状態定義
+    // 状態定義の簡素化
     typedef enum logic [1:0] {
-        IDLE      = 2'b00,
-        TRANSFER  = 2'b01,
-        COMPUTE   = 2'b10
+        ST_IDLE      = 2'b00,
+        ST_TRANSFER  = 2'b01,
+        ST_COMPUTE   = 2'b10
     } unit_state_t;
 
-    // 最適化されたオペコード
+    // オペコードの定義（変更なし）
     typedef enum logic [1:0] {
-        OP_NOP   = 2'b00,  // 無操作
-        OP_LOAD  = 2'b01,  // データロード
-        OP_STORE = 2'b10,  // データストア
-        OP_COMP  = 2'b11   // 計算操作
+        OP_NOP   = 2'b00,
+        OP_LOAD  = 2'b01,
+        OP_STORE = 2'b10,
+        OP_COMP  = 2'b11
     } operation_code_t;
 
-    // 計算タイプの定義
+    // 計算タイプの定義（変更なし）
     typedef enum logic [1:0] {
-        COMP_ADD  = 2'b00,  // ベクトル加算
-        COMP_MUL  = 2'b01,  // 行列ベクトル乗算
-        COMP_TANH = 2'b10,  // tanh活性化
-        COMP_RELU = 2'b11   // ReLU活性化
+        COMP_ADD  = 2'b00,
+        COMP_MUL  = 2'b01,
+        COMP_TANH = 2'b10,
+        COMP_RELU = 2'b11
     } computation_type_t;
 
-    // データ構造の定義
+    // データ構造の定義（変更なし）
     typedef struct packed {
         logic [VECTOR_WIDTH-1:0] data [VECTOR_DEPTH];
     } vector_data_t;
@@ -38,13 +38,13 @@ package accel_pkg;
         logic [1:0] data [MATRIX_DEPTH][MATRIX_DEPTH];
     } matrix_data_t;
 
-    // 最適化された制御パケット定義
+    // 制御パケットの定義（最適化）
     typedef struct packed {
-        logic [5:0] encoded_control;  // [5:4]:unit_id, [3:2]:op_code, [1:0]:comp_type
-        logic [7:0] data_control;     // [7:4]:addr, [3]:valid, [2:0]:size
+        logic [5:0] encoded_control;  // より明確な制御信号エンコーディング
+        logic [7:0] data_control;     // データ制御の柔軟性向上
     } control_packet_t;
 
-    // デコード後の制御信号
+    // デコード後の制御信号（最適化）
     typedef struct packed {
         logic [1:0] unit_id;
         operation_code_t op_code;
