@@ -1,92 +1,60 @@
-// decoder.sv
+// decoder.sv - 主要な変更部分
+
 module decoder
     import accel_pkg::*;
 (
     input  logic clk,
     input  logic rst_n,
-    
-    // 制御インターフェース
     input  ctrl_packet_t ctrl_packet,
-    
-    // デコード出力
     output decoded_ctrl_t decoded_ctrl,
     output logic decode_valid,
     output logic [1:0] error_status
 );
-    // エラー検出用の内部信号
-    logic invalid_op_code;
-    logic invalid_config;
 
-    // デコードロジック
+    // デコードロジック（更新）
     always_comb begin
         // デフォルト値の設定
         decoded_ctrl = '0;
         decode_valid = 1'b1;
         error_status = 2'b00;
-        invalid_op_code = 1'b0;
-        invalid_config = 1'b0;
 
         // ユニットIDのデコード
-        decoded_ctrl.unit_id = ctrl_packet.ctrl[5:4];
+        decoded_ctrl.unit_id = ctrl_packet.unit_id;
+        decoded_ctrl.src_unit_id = ctrl_packet.src_unit_id;
         
-        // オペコードのデコード
-        unique case (ctrl_packet.ctrl[3:2])
-            2'b00: decoded_ctrl.op_code = OP_NOP;
-            2'b01: decoded_ctrl.op_code = OP_LOAD;
-            2'b10: decoded_ctrl.op_code = OP_STORE;
-            2'b11: decoded_ctrl.op_code = OP_COMPUTE;
-            default: invalid_op_code = 1'b1;
+        // オペコードのデコード（更新）
+        unique case (ctrl_packet.ctrl[5:3])
+            3'b000: decoded_ctrl.op_code = OP_NOP;
+            3'b001: decoded_ctrl.op_code = OP_LOAD;
+            3'b010: decoded_ctrl.op_code = OP_STORE;
+            3'b011: decoded_ctrl.op_code = OP_COMPUTE;
+            3'b100: decoded_ctrl.op_code = OP_COPY;
+            3'b101: decoded_ctrl.op_code = OP_ADD_VEC;
+            default: begin
+                error_status[1] = 1'b1;
+                decode_valid = 1'b0;
+            end
         endcase
         
-        // 計算タイプのデコード
-        unique case (ctrl_packet.ctrl[1:0])
+        // 計算タイプのデコード（既存）
+        unique case (ctrl_packet.ctrl[2:1])
             2'b00: decoded_ctrl.comp_type = COMP_ADD;
             2'b01: decoded_ctrl.comp_type = COMP_MUL;
             2'b10: decoded_ctrl.comp_type = COMP_TANH;
             2'b11: decoded_ctrl.comp_type = COMP_RELU;
-            default: invalid_op_code = 1'b1;
-        endcase
-        
-        // 構成情報のデコード
-        decoded_ctrl.addr = ctrl_packet.config[7:4];
-        decoded_ctrl.valid = ctrl_packet.config[3];
-        decoded_ctrl.size = ctrl_packet.config[2:0];
-
-        // エラー検出
-        case (decoded_ctrl.op_code)
-            OP_NOP: begin
-                // NOP命令では追加データは許可されない
-                if (|ctrl_packet.config) begin
-                    invalid_config = 1'b1;
-                end
-            end
-            OP_COMPUTE: begin
-                // 計算命令では有効フラグが必要
-                if (!ctrl_packet.config[3]) begin
-                    invalid_config = 1'b1;
-                end
+            default: begin
+                error_status[1] = 1'b1;
+                decode_valid = 1'b0;
             end
         endcase
 
-        // エラーステータスの設定
-        if (invalid_op_code) begin
-            error_status = 2'b10;  // オペコードエラー
-            decode_valid = 1'b0;
-        end
-        
-        if (invalid_config) begin
-            error_status = 2'b01;  // 構成情報エラー
+        // 追加：ソースユニットIDの検証
+        if ((decoded_ctrl.op_code == OP_COPY || 
+             decoded_ctrl.op_code == OP_ADD_VEC) &&
+            decoded_ctrl.src_unit_id >= UNIT_COUNT) begin
+            error_status[0] = 1'b1;
             decode_valid = 1'b0;
         end
     end
 
-    // デバッグ用ログ
-    // synthesis translate_off
-    always @(posedge clk) begin
-        if (!decode_valid) begin
-            $display("デコードエラー: ctrl_packet=0x%h, error_status=0x%h", 
-                     ctrl_packet, error_status);
-        end
-    end
-    // synthesis translate_on
 endmodule
