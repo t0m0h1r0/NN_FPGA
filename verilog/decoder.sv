@@ -1,75 +1,72 @@
 // decoder.sv
-module optimized_decoder
+module decoder
     import accel_pkg::*;
 (
     input  logic clk,
     input  logic rst_n,
     
-    // 最適化された制御インターフェース
-    input  logic [5:0] encoded_control,    // [5:4]:unit_id, [3:2]:op_code, [1:0]:comp_type
-    input  logic [7:0] data_control,       // データ制御用の追加フィールド
+    // 制御インターフェース
+    input  ctrl_packet_t ctrl_packet,
     
-    // デコード後の制御信号
-    output control_signal_t decoded_control,
+    // デコード出力
+    output decoded_ctrl_t decoded_ctrl,
     output logic decode_valid,
     output logic [1:0] error_status
 );
     // エラー検出用の内部信号
     logic invalid_op_code;
-    logic invalid_data_control;
+    logic invalid_config;
 
-    // デコード処理と検証
+    // デコードロジック
     always_comb begin
         // デフォルト値の設定
-        decoded_control = '0;
+        decoded_ctrl = '0;
         decode_valid = 1'b1;
         error_status = 2'b00;
         invalid_op_code = 1'b0;
-        invalid_data_control = 1'b0;
+        invalid_config = 1'b0;
 
         // ユニットIDのデコード
-        decoded_control.unit_id = encoded_control[5:4];
+        decoded_ctrl.unit_id = ctrl_packet.ctrl[5:4];
         
         // オペコードのデコード
-        unique case (encoded_control[3:2])
-            2'b00: begin
-                decoded_control.op_code = OP_NOP;
-                // NOP命令では追加データは許可されない
-                if (|data_control) begin
-                    invalid_data_control = 1'b1;
-                end
-            end
-            2'b01: decoded_control.op_code = OP_LOAD;
-            2'b10: decoded_control.op_code = OP_STORE;
-            2'b11: begin
-                decoded_control.op_code = OP_COMP;
-                // 計算命令では有効フラグが必要
-                if (!data_control[3]) begin
-                    invalid_data_control = 1'b1;
-                end
-            end
-            default: begin
-                // 不正なオペコード
-                invalid_op_code = 1'b1;
-            end
+        unique case (ctrl_packet.ctrl[3:2])
+            2'b00: decoded_ctrl.op_code = OP_NOP;
+            2'b01: decoded_ctrl.op_code = OP_LOAD;
+            2'b10: decoded_ctrl.op_code = OP_STORE;
+            2'b11: decoded_ctrl.op_code = OP_COMPUTE;
+            default: invalid_op_code = 1'b1;
         endcase
         
         // 計算タイプのデコード
-        unique case (encoded_control[1:0])
-            2'b00: decoded_control.comp_type = COMP_ADD;
-            2'b01: decoded_control.comp_type = COMP_MUL;
-            2'b10: decoded_control.comp_type = COMP_TANH;
-            2'b11: decoded_control.comp_type = COMP_RELU;
-            default: begin
-                // 不正な計算タイプ（通常は発生しない）
-                invalid_op_code = 1'b1;
-            end
+        unique case (ctrl_packet.ctrl[1:0])
+            2'b00: decoded_ctrl.comp_type = COMP_ADD;
+            2'b01: decoded_ctrl.comp_type = COMP_MUL;
+            2'b10: decoded_ctrl.comp_type = COMP_TANH;
+            2'b11: decoded_ctrl.comp_type = COMP_RELU;
+            default: invalid_op_code = 1'b1;
         endcase
         
-        // データ制御フィールドのデコード
-        decoded_control.addr = data_control[7:4];
-        decoded_control.valid = data_control[3];
-        decoded_control.size = data_control[2:0];
+        // 構成情報のデコード
+        decoded_ctrl.addr = ctrl_packet.config[7:4];
+        decoded_ctrl.valid = ctrl_packet.config[3];
+        decoded_ctrl.size = ctrl_packet.config[2:0];
+
+        // エラー検出
+        case (decoded_ctrl.op_code)
+            OP_NOP: begin
+                // NOP命令では追加データは許可されない
+                if (|ctrl_packet.config) begin
+                    invalid_config = 1'b1;
+                end
+            end
+            OP_COMPUTE: begin
+                // 計算命令では有効フラグが必要
+                if (!ctrl_packet.config[3]) begin
+                    invalid_config = 1'b1;
+                end
+            end
+        endcase
 
         // エラーステータスの設定
         if (invalid_op_code) begin
@@ -77,8 +74,8 @@ module optimized_decoder
             decode_valid = 1'b0;
         end
         
-        if (invalid_data_control) begin
-            error_status = 2'b01;  // データ制御エラー
+        if (invalid_config) begin
+            error_status = 2'b01;  // 構成情報エラー
             decode_valid = 1'b0;
         end
     end
@@ -87,8 +84,8 @@ module optimized_decoder
     // synthesis translate_off
     always @(posedge clk) begin
         if (!decode_valid) begin
-            $display("デコードエラー: encoded_control=0x%h, data_control=0x%h, error_status=0x%h", 
-                     encoded_control, data_control, error_status);
+            $display("デコードエラー: ctrl_packet=0x%h, error_status=0x%h", 
+                     ctrl_packet, error_status);
         end
     end
     // synthesis translate_on

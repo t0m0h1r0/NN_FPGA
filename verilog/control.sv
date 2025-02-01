@@ -1,8 +1,8 @@
 // control.sv
-module control
+module system_controller
     import accel_pkg::*;
 (
-    // 基本インターフェース
+    // 基本システムインターフェース
     input  logic clk,
     input  logic rst_n,
 
@@ -10,43 +10,28 @@ module control
     input  logic [7:0] sys_control,
     output logic [7:0] sys_status,
 
-    // 最適化されたユニット制御インターフェース
-    output control_packet_t [NUM_PROCESSING_UNITS-1:0] unit_control,
-    input  logic [NUM_PROCESSING_UNITS-1:0] unit_ready,
-    input  logic [NUM_PROCESSING_UNITS-1:0] unit_done,
+    // ユニット制御インターフェース
+    output ctrl_packet_t [UNIT_COUNT-1:0] unit_control,
+    input  logic [UNIT_COUNT-1:0] unit_ready,
+    input  logic [UNIT_COUNT-1:0] unit_done,
 
     // パフォーマンスモニタリング
-    output logic [15:0] perf_counter,
-
-    // 動的スケジューリング用追加インターフェース
-    output logic [NUM_PROCESSING_UNITS-1:0] unit_priority,
-    input  logic [NUM_PROCESSING_UNITS-1:0] unit_workload
+    output logic [15:0] perf_counter
 );
-    // スケジューリング状態の定義
+    // システム状態定義
     typedef enum logic [2:0] {
         ST_IDLE,
-        ST_ANALYZE,
-        ST_SCHEDULE,
+        ST_INIT,
         ST_DISPATCH,
         ST_EXECUTE,
         ST_SYNC
-    } scheduling_state_t;
+    } sys_state_e;
 
-    // 内部状態と制御信号
-    scheduling_state_t current_state;
+    // システム内部状態
+    sys_state_e current_state;
     logic [3:0] active_units;
     logic [15:0] cycle_counter;
-    
-    // ワークロード管理
-    logic [NUM_PROCESSING_UNITS-1:0] unit_utilization;
-    logic [NUM_PROCESSING_UNITS-1:0] unit_stall_history;
-
-    // スケジューリングテーブル
-    struct packed {
-        logic valid;
-        logic [1:0] priority;
-        logic [3:0] estimated_cycles;
-    } scheduling_table [NUM_PROCESSING_UNITS];
+    logic [UNIT_COUNT-1:0] unit_priority;
 
     // メインステートマシン
     always_ff @(posedge clk or negedge rst_n) begin
@@ -54,20 +39,19 @@ module control
             reset_system();
         end
         else begin
-            // サイクルカウンタの更新
+            // サイクルカウンタ更新
             cycle_counter <= cycle_counter + 1;
             
             // ステート遷移
             case (current_state)
                 ST_IDLE:     handle_idle_state();
-                ST_ANALYZE:  handle_workload_analysis();
-                ST_SCHEDULE: perform_dynamic_scheduling();
-                ST_DISPATCH: handle_task_dispatch();
-                ST_EXECUTE:  monitor_execution();
+                ST_INIT:     handle_init_state();
+                ST_DISPATCH: handle_dispatch_state();
+                ST_EXECUTE:  handle_execute_state();
                 ST_SYNC:     handle_sync_state();
             endcase
 
-            // ステータス更新
+            // システムステータス更新
             update_system_status();
         end
     end
@@ -79,64 +63,41 @@ module control
         cycle_counter <= '0;
         sys_status <= '0;
         perf_counter <= '0;
-        unit_utilization <= '0;
-        unit_stall_history <= '0;
+        unit_priority <= {UNIT_COUNT{1'b1}};  // 全ユニットに初期優先度
         
-        // スケジューリングテーブルのクリア
-        for (int i = 0; i < NUM_PROCESSING_UNITS; i++) begin
+        // 全ユニット制御信号のクリア
+        for (int i = 0; i < UNIT_COUNT; i++) begin
             unit_control[i] <= '0;
-            scheduling_table[i].valid <= 1'b0;
         end
     endtask
 
-    // アイドル状態のハンドリング
+    // アイドル状態ハンドリング
     task handle_idle_state();
         if (sys_control[0]) begin  // システム起動信号
-            current_state <= ST_ANALYZE;
+            current_state <= ST_INIT;
+            active_units <= '0;
         end
     endtask
 
-    // ワークロード分析
-    task handle_workload_analysis();
-        // 各ユニットの利用状況と待ち時間を分析
-        for (int i = 0; i < NUM_PROCESSING_UNITS; i++) begin
-            // 利用率の更新
-            unit_utilization[i] <= unit_workload[i];
-            
-            // スタル履歴の追跡
-            if (!unit_ready[i]) begin
-                unit_stall_history[i] <= unit_stall_history[i] + 1;
+    // 初期化状態ハンドリング
+    task handle_init_state();
+        // 全ユニットの初期化
+        for (int i = 0; i < UNIT_COUNT; i++) begin
+            if (unit_ready[i]) begin
+                // NOP命令の設定
+                unit_control[i].ctrl <= {i[1:0], 2'b00, 2'b00};
+                unit_control[i].config <= '0;
             end
         end
-        
-        current_state <= ST_SCHEDULE;
-    endtask
-
-    // 動的スケジューリング
-    task perform_dynamic_scheduling();
-        // 各ユニットの優先度を動的に調整
-        for (int i = 0; i < NUM_PROCESSING_UNITS; i++) begin
-            // スタル時間に基づく優先度調整
-            if (unit_stall_history[i] > 4) begin
-                unit_priority[i] <= 1'b1;  // 高優先度
-            end
-            else begin
-                unit_priority[i] <= 1'b0;  // 通常優先度
-            end
-            
-            // スケジューリングテーブルの更新
-            scheduling_table[i].valid <= unit_ready[i];
-            scheduling_table[i].priority <= unit_priority[i] ? 2'b11 : 2'b01;
-        end
-        
         current_state <= ST_DISPATCH;
     endtask
 
-    // タスク割り当て
-    task handle_task_dispatch();
-        for (int i = 0; i < NUM_PROCESSING_UNITS; i++) begin
-            if (scheduling_table[i].valid) begin
-                // データ転送モードか計算モードかを判定
+    // タスク割り当て状態ハンドリング
+    task handle_dispatch_state();
+        // 優先度に基づくタスク割り当て
+        for (int i = 0; i < UNIT_COUNT; i++) begin
+            if (unit_ready[i] && !active_units[i] && unit_priority[i]) begin
+                // 計算モードかデータ転送モードかを判定
                 if (sys_control[1]) begin  // 計算モード
                     set_compute_control(i);
                 end
@@ -145,50 +106,52 @@ module control
                 end
             end
         end
-        
         current_state <= ST_EXECUTE;
     endtask
 
     // 計算制御の設定
     task set_compute_control(input int unit_index);
-        unit_control[unit_index].encoded_control <= {
+        unit_control[unit_index].ctrl <= {
             unit_index[1:0],         // ユニットID
             2'b11,                    // 計算操作
             sys_control[3:2]          // 計算タイプ
         };
-        unit_control[unit_index].data_control <= {
+        unit_control[unit_index].config <= {
             sys_control[7:4],         // データアドレス
             1'b1,                     // 有効フラグ
             3'b111                    // 最大サイズ
         };
         active_units[unit_index] <= 1'b1;
+        // 使用後に優先度を下げる
+        unit_priority[unit_index] <= 1'b0;
     endtask
 
     // データ転送制御の設定
     task set_transfer_control(input int unit_index);
-        unit_control[unit_index].encoded_control <= {
+        unit_control[unit_index].ctrl <= {
             unit_index[1:0],          // ユニットID
             sys_control[5] ? 2'b10 : 2'b01,  // ストアかロード
             2'b00                     // 未使用
         };
-        unit_control[unit_index].data_control <= {
+        unit_control[unit_index].config <= {
             sys_control[7:4],         // データアドレス
             1'b1,                     // 有効フラグ
             3'b111                    // 最大サイズ
         };
+        active_units[unit_index] <= 1'b1;
+        // 使用後に優先度を下げる
+        unit_priority[unit_index] <= 1'b0;
     endtask
 
-    // 実行状態のモニタリング
-    task monitor_execution();
-        // アクティブユニットの完了を確認
-        for (int i = 0; i < NUM_PROCESSING_UNITS; i++) begin
+    // 実行状態ハンドリング
+    task handle_execute_state();
+        // ユニットの完了と優先度の管理
+        for (int i = 0; i < UNIT_COUNT; i++) begin
             if (unit_done[i]) begin
                 active_units[i] <= 1'b0;
-                // スタル履歴のリセット
-                unit_stall_history[i] <= '0;
-                
-                // 完了したユニットにNOP命令を設定
-                unit_control[i].encoded_control <= {i[1:0], 2'b00, 2'b00};
+                // 完了したユニットにNOP命令を設定し、優先度を復元
+                unit_control[i].ctrl <= {i[1:0], 2'b00, 2'b00};
+                unit_priority[i] <= 1'b1;
             end
         end
 
@@ -198,38 +161,40 @@ module control
         end
     endtask
 
-    // 同期状態のハンドリング
+    // 同期状態ハンドリング
     task handle_sync_state();
         // パフォーマンスカウンタの更新
         perf_counter <= cycle_counter;
         
         // 継続フラグに応じて状態遷移
         if (sys_control[7]) begin  // 継続フラグ
-            current_state <= ST_ANALYZE;
+            current_state <= ST_DISPATCH;
+            // 全ユニットの優先度を復元
+            unit_priority <= {UNIT_COUNT{1'b1}};
         end
         else begin
             current_state <= ST_IDLE;
         end
     endtask
 
-    // システムステータスの更新
+    // システムステータス更新
     task update_system_status();
         sys_status <= {
-            current_state != ST_IDLE,    // ビジー
+            current_state != ST_IDLE,    // システムビジー
             |active_units,               // アクティブユニット存在
             current_state == ST_SYNC,    // 同期状態
             5'b0                         // 予約
         };
     endtask
 
-    // デバッグ用パフォーマンスモニタリング
+    // デバッグ用モニタリング
     // synthesis translate_off
-    always_ff @(posedge clk) begin
+    always @(posedge clk) begin
         if (current_state == ST_EXECUTE) begin
-            $display("スケジューリング状態:");
+            $display("システム状態:");
             $display("アクティブユニット: %b", active_units);
             $display("ユニット優先度: %b", unit_priority);
-            $display("ユニット利用状況: %b", unit_utilization);
+            $display("パフォーマンスカウンタ: %0d", cycle_counter);
         end
     end
     // synthesis translate_on

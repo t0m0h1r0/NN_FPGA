@@ -1,4 +1,4 @@
-// shared.sv
+// shared_compute_unit.sv
 module shared_compute_unit
     import accel_pkg::*;
 (
@@ -12,103 +12,119 @@ module shared_compute_unit
     output logic done,                  // 演算完了
     
     // データインターフェース
-    input  computation_type_t comp_type,
-    input  vector_data_t vector_a,
-    input  vector_data_t vector_b,
-    input  matrix_data_t matrix_in,
-    output vector_data_t result
+    input  comp_type_e comp_type,
+    input  vector_t vector_a,
+    input  vector_t vector_b,
+    input  matrix_t matrix_in,
+    output vector_t result
 );
-    // 内部状態と制御信号
+    // 計算ステージ
+    typedef enum logic [1:0] {
+        ST_IDLE,
+        ST_COMPUTE,
+        ST_COMPLETE
+    } compute_state_e;
+
+    // 内部状態
+    compute_state_e current_state;
     logic [1:0] current_unit;
-    logic processing;
     logic [4:0] compute_counter;
-    
-    // ステータス制御モジュール
-    status_control u_status (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(processing),
-        .max_count(5'd16),  // VECTOR_DEPTH分のカウント
-        .busy(processing),
-        .done(done),
-        .counter(compute_counter)
-    );
 
-    // ベクトルALU
-    vector_alu u_alu (
-        .clk(clk),
-        .op_type(comp_type),
-        .a(vector_a.data[compute_counter]),
-        .b(vector_b.data[compute_counter]),
-        .result(result.data[compute_counter])
-    );
-
-    // 行列演算用の内部ロジック
-    logic [VECTOR_WIDTH-1:0] matrix_product;
-    logic matrix_valid;
-
-    // メインステートマシン
+    // ステータス制御
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             reset_unit();
         end
         else begin
-            // 新しい演算要求の処理
-            if (!processing && request) begin
-                handle_new_request();
-            end
-
-            // 行列乗算の特別な処理
-            if (comp_type == COMP_MUL && processing) begin
-                handle_matrix_multiplication();
-            end
+            // ステートマシン
+            case (current_state)
+                ST_IDLE:     handle_idle_state();
+                ST_COMPUTE:  handle_compute_state();
+                ST_COMPLETE: handle_complete_state();
+            endcase
         end
     end
 
-    // ユニットのリセット
+    // ユニットリセット
     task reset_unit();
         ready <= 1'b1;
-        processing <= 1'b0;
+        done <= 1'b0;
+        current_state <= ST_IDLE;
         current_unit <= 2'b00;
-        matrix_valid <= 1'b0;
+        compute_counter <= '0;
     endtask
 
-    // 新しい演算要求の処理
-    task handle_new_request();
-        current_unit <= unit_id;
-        processing <= 1'b1;
-        ready <= 1'b0;
+    // アイドル状態ハンドリング
+    task handle_idle_state();
+        if (request) begin
+            current_unit <= unit_id;
+            current_state <= ST_COMPUTE;
+            ready <= 1'b0;
+            compute_counter <= '0;
+        end
     endtask
 
-    // 行列乗算の処理
-    task handle_matrix_multiplication();
-        matrix_product <= '0;
-        matrix_valid <= 1'b1;
-        
+    // 計算状態ハンドリング
+    task handle_compute_state();
+        // 計算タイプに応じた処理
+        unique case (comp_type)
+            COMP_ADD:  compute_addition();
+            COMP_MUL:  compute_matrix_multiplication();
+            COMP_TANH: compute_tanh_activation();
+            COMP_RELU: compute_relu_activation();
+        endcase
+
+        // カウンタ更新と状態遷移
+        compute_counter <= compute_counter + 1;
+        if (compute_counter == VECTOR_DEPTH - 1) begin
+            current_state <= ST_COMPLETE;
+        end
+    endtask
+
+    // 加算計算
+    task compute_addition();
+        result.data[compute_counter] = 
+            vector_a.data[compute_counter] + vector_b.data[compute_counter];
+    endtask
+
+    // 行列乗算
+    task compute_matrix_multiplication();
+        logic [VECTOR_WIDTH-1:0] sum = '0;
         for (int j = 0; j < MATRIX_DEPTH; j++) begin
             if (matrix_in.data[compute_counter][j][0]) begin
-                matrix_product <= matrix_product + 
-                    (matrix_in.data[compute_counter][j][1] ? 
-                     -vector_a.data[j] : vector_a.data[j]);
+                sum += matrix_in.data[compute_counter][j][1] ? 
+                    -vector_a.data[j] : vector_a.data[j];
             end
         end
-        
-        // 最終的な結果の設定
-        if (done) begin
-            result.data[compute_counter] <= matrix_product;
-        end
+        result.data[compute_counter] = sum;
     endtask
 
-    // 結果の選択と出力
-    always_comb begin
-        // 演算完了時かつ要求元ユニットが一致する場合のみ結果を出力
-        result = (done && current_unit == unit_id) ? result : '0;
-    end
+    // Tanh活性化
+    task compute_tanh_activation();
+        result.data[compute_counter] = 
+            vector_a.data[compute_counter][VECTOR_WIDTH-1] ? 
+            {1'b1, {(VECTOR_WIDTH-1){1'b0}}} :
+            {1'b0, {(VECTOR_WIDTH-1){1'b1}}};
+    endtask
+
+    // ReLU活性化
+    task compute_relu_activation();
+        result.data[compute_counter] = 
+            vector_a.data[compute_counter][VECTOR_WIDTH-1] ? 
+            '0 : vector_a.data[compute_counter];
+    endtask
+
+    // 完了状態ハンドリング
+    task handle_complete_state();
+        done <= 1'b1;
+        ready <= 1'b1;
+        current_state <= ST_IDLE;
+    endtask
 
     // デバッグ用モニタリング
     // synthesis translate_off
     always @(posedge clk) begin
-        if (processing) begin
+        if (current_state == ST_COMPUTE) begin
             $display("共有計算ユニット: unit_id=%0d, comp_type=%0d, counter=%0d", 
                      current_unit, comp_type, compute_counter);
         end

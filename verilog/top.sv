@@ -1,8 +1,8 @@
 // top.sv
-module top
+module accelerator_top
     import accel_pkg::*;
 (
-    // システムインターフェース
+    // システム基本インターフェース
     input  logic clk,
     input  logic rst_n,
     input  logic [7:0] sys_control,
@@ -10,28 +10,27 @@ module top
     output logic [15:0] perf_counter,
 
     // データインターフェース
-    input  vector_data_t data_in [NUM_PROCESSING_UNITS],
-    input  matrix_data_t matrix_in [NUM_PROCESSING_UNITS],
-    output vector_data_t data_out [NUM_PROCESSING_UNITS]
+    input  vector_t data_in [UNIT_COUNT],
+    input  matrix_t matrix_in [UNIT_COUNT],
+    output vector_t data_out [UNIT_COUNT]
 );
     // 内部接続信号
-    control_packet_t [NUM_PROCESSING_UNITS-1:0] unit_control;
-    logic [NUM_PROCESSING_UNITS-1:0] unit_ready;
-    logic [NUM_PROCESSING_UNITS-1:0] unit_done;
+    ctrl_packet_t [UNIT_COUNT-1:0] unit_control;
+    logic [UNIT_COUNT-1:0] unit_ready;
+    logic [UNIT_COUNT-1:0] unit_done;
     
-    // 共有演算ユニット用信号
-    logic [1:0] current_unit_id;
-    logic [NUM_PROCESSING_UNITS-1:0] unit_compute_request;
+    // 共有リソース制御信号
+    logic [UNIT_COUNT-1:0] unit_compute_request;
     logic compute_ready;
     logic compute_done;
-    computation_type_t current_comp_type;
-    vector_data_t current_vector_a;
-    vector_data_t current_vector_b;
-    matrix_data_t current_matrix;
-    vector_data_t compute_result;
+    comp_type_e current_comp_type;
+    vector_t current_vector_a;
+    vector_t current_vector_b;
+    matrix_t current_matrix;
+    vector_t compute_result;
 
-    // システムコントローラのインスタンス化
-    control u_control (
+    // システムコントローラ
+    system_controller u_system_controller (
         .clk(clk),
         .rst_n(rst_n),
         .sys_control(sys_control),
@@ -42,12 +41,12 @@ module top
         .perf_counter(perf_counter)
     );
 
-    // 共有演算ユニット
-    shared_compute_unit u_compute (
+    // 共有計算ユニット
+    shared_compute_unit u_shared_compute (
         .clk(clk),
         .rst_n(rst_n),
-        .unit_id(current_unit_id),
-        .request(unit_compute_request[current_unit_id]),
+        .unit_id('0),  // 8ビットのユニットID
+        .request(unit_compute_request[0]),
         .ready(compute_ready),
         .done(compute_done),
         .comp_type(current_comp_type),
@@ -59,11 +58,11 @@ module top
 
     // 処理ユニットの生成
     generate
-        for (genvar i = 0; i < NUM_PROCESSING_UNITS; i++) begin : gen_units
-            unit u_unit (
+        for (genvar i = 0; i < UNIT_COUNT; i++) begin : gen_processing_units
+            processing_unit u_unit (
                 .clk(clk),
                 .rst_n(rst_n),
-                .unit_id(i[1:0]),
+                .unit_id(i[UNIT_ID_WIDTH-1:0]),
                 .control(unit_control[i]),
                 .ready(unit_ready[i]),
                 .done(unit_done[i]),
@@ -73,6 +72,25 @@ module top
             );
         end
     endgenerate
+
+    // リソース間の接続ロジック
+    always_comb begin
+        // 共有計算ユニットへのデータ接続
+        unit_compute_request = '0;
+        current_vector_a = '0;
+        current_vector_b = '0;
+        current_matrix = '0;
+        current_comp_type = COMP_ADD;
+
+        // システムコントローラからの制御に基づいて接続
+        if (sys_control[1]) begin  // 計算モード
+            unit_compute_request[0] = 1'b1;
+            current_vector_a = data_in[0];
+            current_vector_b = data_in[1];
+            current_matrix = matrix_in[0];
+            current_comp_type = comp_type_e'(sys_control[3:2]);
+        end
+    end
 
     // デバッグ用パフォーマンスモニタリング
     // synthesis translate_off
