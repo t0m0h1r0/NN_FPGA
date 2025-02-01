@@ -1,85 +1,97 @@
-//! Operation execution engine
+//! 演算実行エンジン
 //!
-//! This module provides the execution engine for running operations on the FPGA.
+//! FPGAでの演算実行を管理し、信頼性の高い処理を提供します。
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{Duration, sleep};
-use async_trait::async_trait;
+use tokio::time;
 use tracing::{info, warn, error};
 
-use crate::domain::{
-    operation::{Operation, UnitId, OperationStatus},
-    error::{Result, DomainError},
+use crate::types::{
+    UnitId, 
+    Operation, 
+    OperationStatus,
 };
-use crate::infra::{
-    fpga::{FpgaInterface, Command, Response},
-    memory::{MemoryManager, BlockId, LockReason},
+use crate::error::{Result, DomainError};
+use crate::fpga::{
+    FpgaInterface, 
+    FpgaCommand, 
+    FpgaResponse,
+};
+use crate::memory::{
+    MemoryManager, 
+    BlockId, 
+    LockReason,
 };
 
-/// Maximum retry attempts for operations
+/// 最大リトライ回数
 const MAX_RETRIES: u32 = 3;
-
-/// Retry delay in milliseconds
+/// リトライ遅延（ミリ秒）
 const RETRY_DELAY_MS: u64 = 100;
+/// 演算タイムアウト
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Operation context containing execution details
+/// 演算コンテキスト
 #[derive(Debug)]
 pub struct OperationContext {
-    /// Operation to execute
+    /// 実行する演算
     pub operation: Operation,
-    /// Target unit
+    /// ターゲットユニット
     pub unit: UnitId,
-    /// Associated memory block
+    /// 関連するメモリブロック
     pub block: Option<BlockId>,
-    /// Number of retry attempts
+    /// リトライ回数
     pub retries: u32,
-    /// Start timestamp
-    pub start_time: std::time::Instant,
+    /// 開始タイムスタンプ
+    pub start_time: Instant,
 }
 
 impl OperationContext {
-    /// Create new operation context
+    /// 新規演算コンテキストの作成
     pub fn new(operation: Operation, unit: UnitId) -> Self {
         Self {
             operation,
             unit,
             block: None,
             retries: 0,
-            start_time: std::time::Instant::now(),
+            start_time: Instant::now(),
         }
     }
 
-    /// Check if operation has exceeded retry limit
+    /// リトライ回数超過の確認
     pub fn exceeded_retries(&self) -> bool {
         self.retries >= MAX_RETRIES
     }
 
-    /// Get operation duration
+    /// 演算期間の取得
     pub fn duration(&self) -> Duration {
         self.start_time.elapsed()
     }
 }
 
-/// Operation execution trait
-#[async_trait]
+/// 演算実行トレイト
+#[async_trait::async_trait]
 pub trait OperationExecutor: Send + Sync {
-    /// Execute operation
+    /// 演算の実行
     async fn execute(&self, context: OperationContext) -> Result<OperationStatus>;
     
-    /// Cancel operation
+    /// 演算のキャンセル
     async fn cancel(&self, unit: UnitId) -> Result<()>;
 }
 
-/// Main executor implementation
+/// メイン実行エンジン
 pub struct Executor {
+    /// FPGAインターフェース
     fpga: Arc<Mutex<Box<dyn FpgaInterface>>>,
+    /// メモリマネージャ
     memory: Arc<MemoryManager>,
+    /// アクティブな演算
     active_operations: Arc<RwLock<Vec<OperationContext>>>,
 }
 
 impl Executor {
-    /// Create new executor
+    /// 新規実行エンジンの生成
     pub fn new(
         fpga: Box<dyn FpgaInterface>,
         memory: Arc<MemoryManager>,
@@ -91,9 +103,9 @@ impl Executor {
         }
     }
 
-    /// Handle operation preparation
+    /// 演算準備
     async fn prepare_operation(&self, context: &mut OperationContext) -> Result<()> {
-        // Lock required memory blocks
+        // メモリブロックのロック
         if let Some(block_id) = context.block {
             self.memory.lock(
                 block_id,
@@ -102,43 +114,50 @@ impl Executor {
             ).await?;
         }
 
-        // Record operation start
+        // アクティブ演算リストへの追加
         let mut active_ops = self.active_operations.write().await;
         active_ops.push(context.clone());
 
         Ok(())
     }
 
-    /// Handle operation completion
+    /// 演算完了処理
     async fn complete_operation(
         &self,
         context: &OperationContext,
         status: OperationStatus
     ) -> Result<()> {
-        // Unlock memory blocks
+        // メモリブロックのロック解除
         if let Some(block_id) = context.block {
             self.memory.unlock(block_id).await?;
         }
 
-        // Remove from active operations
+        // アクティブ演算リストからの削除
         let mut active_ops = self.active_operations.write().await;
         active_ops.retain(|op| op.unit != context.unit);
 
-        // Log completion
+        // 演算完了のログ
         match status {
             OperationStatus::Success => {
                 info!(
-                    "Operation completed successfully: {:?} on unit {}",
+                    "演算成功: {:?} (ユニット {})",
                     context.operation,
                     context.unit.raw()
                 );
             }
             OperationStatus::Failed { code } => {
                 error!(
-                    "Operation failed: {:?} on unit {}, error code {}",
+                    "演算失敗: {:?} (ユニット {}, エラーコード {})",
                     context.operation,
                     context.unit.raw(),
                     code
+                );
+            }
+            OperationStatus::InProgress => {
+                warn!(
+                    "演算進行中: {:?} (ユニット {})",
+                    context.operation,
+                    context.unit.raw()
                 );
             }
         }
@@ -146,75 +165,107 @@ impl Executor {
         Ok(())
     }
 
-    /// Retry failed operation
+    /// 演算リトライ
     async fn retry_operation(&self, mut context: OperationContext) -> Result<OperationStatus> {
+        // リトライ回数のインクリメント
         context.retries += 1;
+        
         warn!(
-            "Retrying operation {:?} on unit {}, attempt {}/{}",
+            "演算リトライ: {:?} (ユニット {}, リトライ {}/{})",
             context.operation,
             context.unit.raw(),
             context.retries,
             MAX_RETRIES
         );
 
-        sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        // リトライ遅延
+        time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        
+        // 演算の再実行
         self.execute(context).await
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl OperationExecutor for Executor {
     async fn execute(&self, mut context: OperationContext) -> Result<OperationStatus> {
-        // Prepare operation
+        // 演算準備
         self.prepare_operation(&mut context).await?;
 
-        // Send command to FPGA
-        let mut fpga = self.fpga.lock().await;
-        fpga.send_command(Command::Execute {
-            unit_id: context.unit,
-            operation: context.operation.clone(),
-        }).await?;
+        // タイムアウト付きの演算実行
+        let result = time::timeout(OPERATION_TIMEOUT, async {
+            // FPGAへのコマンド送信
+            let mut fpga = self.fpga.lock().await;
+            fpga.send_command(FpgaCommand::Execute {
+                unit_id: context.unit,
+                operation: context.operation.clone(),
+            }).await?;
 
-        // Wait for response
-        let response = fpga.receive_response().await?;
-        
-        match response {
-            Response::Status { status, .. } => {
-                match status {
-                    OperationStatus::Success => {
-                        self.complete_operation(&context, status).await?;
-                        Ok(status)
-                    }
-                    OperationStatus::Failed { .. } => {
-                        if context.exceeded_retries() {
+            // レスポンス待機
+            let response = fpga.receive_response().await?;
+            
+            // レスポンス処理
+            match response {
+                FpgaResponse::Status { status, .. } => {
+                    match status {
+                        OperationStatus::Success => {
                             self.complete_operation(&context, status).await?;
                             Ok(status)
-                        } else {
-                            self.retry_operation(context).await
+                        }
+                        OperationStatus::Failed { .. } => {
+                            if context.exceeded_retries() {
+                                self.complete_operation(&context, status).await?;
+                                Ok(status)
+                            } else {
+                                self.retry_operation(context).await
+                            }
+                        }
+                        OperationStatus::InProgress => {
+                            self.complete_operation(&context, status).await?;
+                            Ok(status)
                         }
                     }
                 }
+                FpgaResponse::Error { code, message } => {
+                    error!(
+                        "FPGAエラー: {} (コード: {})",
+                        message,
+                        code
+                    );
+                    Err(DomainError::operation_error(
+                        context.operation.clone(),
+                        message
+                    ))
+                }
             }
-            Response::Error { code, message, .. } => {
+        }).await;
+
+        // タイムアウト処理
+        match result {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
                 error!(
-                    "FPGA error: {} (code: {})",
-                    message,
-                    code
+                    "演算タイムアウト: {:?} (ユニット {})",
+                    context.operation,
+                    context.unit.raw()
                 );
-                Err(DomainError::OperationFailed {
-                    operation: format!("{:?}", context.operation),
-                    reason: message,
-                }.into())
+                Err(DomainError::operation_error(
+                    context.operation.clone(), 
+                    "演算タイムアウト"
+                ))
             }
         }
     }
 
     async fn cancel(&self, unit: UnitId) -> Result<()> {
-        // Send cancel command
+        // キャンセルコマンド送信
         let mut fpga = self.fpga.lock().await;
-        fpga.send_command(Command::Reset { unit_id: unit }).await?;
+        fpga.send_command(FpgaCommand::Reset { 
+            unit_id: unit 
+        }).await?;
 
-        // Clean up any active operations
+        // アクティブ演算のクリーンアップ
         let mut active_ops = self.active_operations.write().await;
         if let Some(op) = active_ops.iter().find(|op| op.unit == unit) {
             if let Some(block_id) = op.block {
@@ -230,7 +281,7 @@ impl OperationExecutor for Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::fpga::MockFpga;
+    use crate::fpga::MockFpga;
 
     #[tokio::test]
     async fn test_operation_execution() {
@@ -240,7 +291,7 @@ mod tests {
             memory.clone(),
         );
 
-        // Test successful execution
+        // 正常な実行テスト
         let context = OperationContext::new(
             Operation::Copy {
                 source: UnitId::new(0).unwrap(),
@@ -251,7 +302,7 @@ mod tests {
         let status = executor.execute(context).await.unwrap();
         assert!(matches!(status, OperationStatus::Success));
 
-        // Test cancellation
+        // キャンセルテスト
         let unit = UnitId::new(1).unwrap();
         assert!(executor.cancel(unit).await.is_ok());
     }
@@ -271,11 +322,11 @@ mod tests {
             UnitId::new(1).unwrap(),
         );
 
-        // Simulate retries
+        // リトライシミュレーション
         context.retries = MAX_RETRIES - 1;
         let status = executor.execute(context).await.unwrap();
         
-        // Even mock FPGA should succeed eventually
+        // モックFPGAは最終的に成功するはず
         assert!(matches!(status, OperationStatus::Success));
     }
 }
