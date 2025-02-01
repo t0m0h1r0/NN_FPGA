@@ -1,4 +1,4 @@
-// shared_compute_unit.sv
+// shared_compute_unit.sv の更新
 module shared_compute_unit
     import accel_pkg::*;
 (
@@ -16,112 +16,125 @@ module shared_compute_unit
     input  data_t data_in,
     output data_t result
 );
-    // 計算ステージ
-    typedef enum logic [1:0] {
-        ST_IDLE,
-        ST_COMPUTE,
-        ST_COMPLETE
-    } compute_state_e;
+    // 1s.31形式の固定小数点数を使用
+    fixed_point_1s31_t fixed_input_vector [DATA_DEPTH];
+    fixed_point_1s31_t fixed_result_vector [DATA_DEPTH];
 
-    // 内部状態
-    compute_state_e current_state;
-    logic [1:0] current_unit;
-    logic [4:0] compute_counter;
-
-    // ステータス制御
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            reset_unit();
-        end
-        else begin
-            // ステートマシン
-            case (current_state)
-                ST_IDLE:     handle_idle_state();
-                ST_COMPUTE:  handle_compute_state();
-                ST_COMPLETE: handle_complete_state();
-            endcase
+    // データ変換ステージ
+    always_comb begin
+        // 入力データを1s.31形式に変換
+        for (int i = 0; i < DATA_DEPTH; i++) begin
+            fixed_input_vector[i] = float_to_fixed_point_1s31(data_in.vector.data[i]);
         end
     end
 
-    // ユニットリセット
-    task reset_unit();
-        ready <= 1'b1;
-        done <= 1'b0;
-        current_state <= ST_IDLE;
-        current_unit <= 2'b00;
-        compute_counter <= '0;
-    endtask
-
-    // アイドル状態ハンドリング
-    task handle_idle_state();
-        if (request) begin
-            current_unit <= unit_id;
-            current_state <= ST_COMPUTE;
-            ready <= 1'b0;
-            compute_counter <= '0;
-        end
-    endtask
-
-    // 計算状態ハンドリング
-    task handle_compute_state();
-        // 計算タイプに応じた処理
+    // 計算ステージ（固定小数点演算）
+    always_comb begin
         unique case (comp_type)
-            COMP_ADD:  compute_addition();
-            COMP_MUL:  compute_matrix_multiplication();
-            COMP_TANH: compute_tanh_activation();
-            COMP_RELU: compute_relu_activation();
+            COMP_ADD: compute_fixed_addition();
+            COMP_MUL: compute_fixed_multiplication();
+            COMP_TANH: compute_fixed_tanh();
+            COMP_RELU: compute_fixed_relu();
+            default: reset_computation();
         endcase
+    end
 
-        // カウンタ更新と状態遷移
-        compute_counter <= compute_counter + 1;
-        if (compute_counter == DATA_DEPTH - 1) begin
-            current_state <= ST_COMPLETE;
-        end
-    endtask
-
-    // 加算計算
-    task compute_addition();
+    // 固定小数点加算
+    task compute_fixed_addition();
         for (int i = 0; i < DATA_DEPTH; i++) begin
-            result.vector.data[i] = data_in.vector.data[i] + data_in.matrix.data[i][0];
+            fixed_result_vector[i] = add_fixed_point(
+                fixed_input_vector[i], 
+                float_to_fixed_point_1s31(32'h3F800000)  // 1.0のIEEE 754表現
+            );
         end
     endtask
 
-    // 行列乗算
-    task compute_matrix_multiplication();
+    // 固定小数点乗算
+    task compute_fixed_multiplication();
         for (int i = 0; i < DATA_DEPTH; i++) begin
-            logic [VECTOR_WIDTH-1:0] sum = '0;
-            for (int j = 0; j < DATA_DEPTH; j++) begin
-                if (data_in.matrix.data[i][j][0]) begin
-                    sum += data_in.matrix.data[i][j][1] ?
-                        -data_in.vector.data[j] : data_in.vector.data[j];
-                end
-            end
-            result.vector.data[i] = sum;
+            fixed_result_vector[i] = multiply_fixed_point(
+                fixed_input_vector[i], 
+                float_to_fixed_point_1s31(32'h40000000)  // 2.0のIEEE 754表現
+            );
         end
     endtask
 
-    // Tanh活性化
-    task compute_tanh_activation();
+    // 固定小数点Tanh近似
+    task compute_fixed_tanh();
         for (int i = 0; i < DATA_DEPTH; i++) begin
-            result.vector.data[i] = data_in.vector.data[i][VECTOR_WIDTH-1] ?
-                {1'b1, {(VECTOR_WIDTH-1){1'b0}}} :
-                {1'b0, {(VECTOR_WIDTH-1){1'b1}}};
+            fixed_result_vector[i] = approximate_tanh(fixed_input_vector[i]);
         end
     endtask
 
-    // ReLU活性化
-    task compute_relu_activation();
+    // 固定小数点ReLU
+    task compute_fixed_relu();
         for (int i = 0; i < DATA_DEPTH; i++) begin
-            result.vector.data[i] = data_in.vector.data[i][VECTOR_WIDTH-1] ?
-                '0 : data_in.vector.data[i];
+            fixed_result_vector[i] = relu_fixed_point(fixed_input_vector[i]);
         end
     endtask
 
-    // 完了状態ハンドリング
-    task handle_complete_state();
-        done <= 1'b1;
-        ready <= 1'b1;
-        current_state <= ST_IDLE;
-    endtask
+    // 結果の変換
+    always_comb begin
+        for (int i = 0; i < DATA_DEPTH; i++) begin
+            result.vector.data[i] = fixed_point_1s31_to_float(fixed_result_vector[i]);
+        end
+    end
 
+    // 固定小数点加算関数
+    function automatic fixed_point_1s31_t add_fixed_point(
+        input fixed_point_1s31_t a, 
+        input fixed_point_1s31_t b
+    );
+        logic signed [32:0] sum;
+        sum = {a.sign, a.value} + {b.sign, b.value};
+        return '{
+            sign: sum[32],
+            value: sum[31:1]
+        };
+    endfunction
+
+    // 固定小数点乗算関数
+    function automatic fixed_point_1s31_t multiply_fixed_point(
+        input fixed_point_1s31_t a, 
+        input fixed_point_1s31_t b
+    );
+        logic signed [62:0] product;
+        product = {a.sign, a.value} * {b.sign, b.value};
+        return '{
+            sign: product[62],
+            value: product[61:31]
+        };
+    endfunction
+
+    // Tanh近似関数（固定小数点）
+    function automatic fixed_point_1s31_t approximate_tanh(
+        input fixed_point_1s31_t x
+    );
+        // 単純な双曲線正接の近似実装
+        if (x.sign && x.value == 0) begin
+            return '{sign: 1'b1, value: '0};  // 負のゼロ
+        end else if (!x.sign && x.value == 0) begin
+            return '{sign: 1'b0, value: '0};  // 正のゼロ
+        end else begin
+            // 簡易的な双曲線正接近似
+            return x.sign ? 
+                '{sign: 1'b1, value: 31'h40000000} :  // -1に近い値
+                '{sign: 1'b0, value: 31'h40000000};   // 1に近い値
+        end
+    endfunction
+
+    // ReLU関数（固定小数点）
+    function automatic fixed_point_1s31_t relu_fixed_point(
+        input fixed_point_1s31_t x
+    );
+        // 負の値は0に、正の値はそのまま
+        return x.sign ? '{sign: 1'b0, value: '0} : x;
+    endfunction
+
+    // リセット時の初期化
+    task reset_computation();
+        for (int i = 0; i < DATA_DEPTH; i++) begin
+            fixed_result_vector[i] = '{sign: 1'b0, value: '0};
+        end
+    endtask
 endmodule

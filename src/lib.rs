@@ -7,4 +7,11 @@ pub mod core {
 pub mod python;
 
 pub use core::error::AcceleratorError;
-pub use core::data_types::{FpgaVector, FpgaMatrix, ComputationType, CompressedNum};
+pub use core::data_types::{
+    FpgaVector, 
+    FpgaMatrix, 
+    ComputationType, 
+    CompressedNum,
+    VectorConversionType,
+    MatrixConversionType
+};

@@ -1,4 +1,9 @@
-use crate::core::data_types::{FpgaVector, FpgaMatrix, ComputationType};
+use crate::core::data_types::{
+    FpgaVector, 
+    FpgaMatrix, 
+    ComputationType, 
+    CompressedNum
+};
 use crate::error::AcceleratorError;
 use log::{info, error};
 
@@ -8,6 +13,29 @@ pub struct FpgaAccelerator {
     memory_vector_size: usize,
     memory_matrix_size: usize,
     block_size: usize,
+}
+
+pub trait ComputeInput {
+    fn as_vector(&self) -> Option<&FpgaVector>;
+    fn as_matrix(&self) -> Option<&FpgaMatrix>;
+}
+
+impl ComputeInput for FpgaVector {
+    fn as_vector(&self) -> Option<&FpgaVector> {
+        Some(self)
+    }
+    fn as_matrix(&self) -> Option<&FpgaMatrix> {
+        None
+    }
+}
+
+impl ComputeInput for FpgaMatrix {
+    fn as_vector(&self) -> Option<&FpgaVector> {
+        None
+    }
+    fn as_matrix(&self) -> Option<&FpgaMatrix> {
+        Some(self)
+    }
 }
 
 impl FpgaAccelerator {
@@ -55,7 +83,7 @@ impl FpgaAccelerator {
         let mut result_vector = Vec::new();
 
         for row_blocks in matrix_blocks {
-            let mut row_result = vec![0.0; self.block_size];
+            let mut row_result = vec![CompressedNum::Full(0.0); self.block_size];
 
             for block in row_blocks {
                 let unit_id = self.select_unit()?;
@@ -65,7 +93,14 @@ impl FpgaAccelerator {
                 
                 // 部分結果を累積
                 for (i, val) in block_result.data.iter().enumerate() {
-                    row_result[i] += val;
+                    // 固定小数点数の加算を考慮
+                    row_result[i] = match (row_result[i], val) {
+                        (CompressedNum::Full(a), CompressedNum::Full(b)) => 
+                            CompressedNum::Full(a + b),
+                        (CompressedNum::FixedPoint1s31(a), CompressedNum::FixedPoint1s31(b)) => 
+                            CompressedNum::FixedPoint1s31(a + b),
+                        _ => CompressedNum::Full(0.0), // エラーハンドリング用のデフォルト値
+                    };
                 }
 
                 self.release_unit(unit_id);
@@ -74,7 +109,14 @@ impl FpgaAccelerator {
             result_vector.extend_from_slice(&row_result);
         }
 
-        FpgaVector::new(result_vector)
+        FpgaVector::from_numpy(&result_vector.iter().map(|x| match x {
+            CompressedNum::Full(val) => *val,
+            CompressedNum::FixedPoint1s31(val) => 
+                CompressedNum::from_fixed_point_1s31(*val),
+            CompressedNum::Trinary(val) => 
+                CompressedNum::from_trinary(*val),
+        }).collect::<Vec<f32>>(), 
+        crate::core::data_types::VectorConversionType::Full)
     }
 
     fn compute_matrix_block(
@@ -89,14 +131,33 @@ impl FpgaAccelerator {
         // 行列ブロックとベクトルの乗算
         let mut block_result = Vec::new();
         for row in &matrix_block.data {
-            let dot_product: f32 = row.iter()
+            let dot_product = row.iter()
                 .zip(input_vector.data.iter())
-                .map(|(a, b)| a * b)
-                .sum();
+                .map(|(a, b)| match (a, b) {
+                    (CompressedNum::Full(a_val), CompressedNum::Full(b_val)) => 
+                        CompressedNum::Full(a_val * b_val),
+                    (CompressedNum::FixedPoint1s31(a_val), CompressedNum::FixedPoint1s31(b_val)) => 
+                        CompressedNum::FixedPoint1s31(a_val * b_val),
+                    _ => CompressedNum::Full(0.0), // エラーハンドリング
+                })
+                .fold(CompressedNum::Full(0.0), |acc, x| match (acc, x) {
+                    (CompressedNum::Full(a), CompressedNum::Full(b)) => 
+                        CompressedNum::Full(a + b),
+                    (CompressedNum::FixedPoint1s31(a), CompressedNum::FixedPoint1s31(b)) => 
+                        CompressedNum::FixedPoint1s31(a + b),
+                    _ => CompressedNum::Full(0.0), // エラーハンドリング
+                });
             block_result.push(dot_product);
         }
 
-        FpgaVector::new(block_result)
+        FpgaVector::from_numpy(&block_result.iter().map(|x| match x {
+            CompressedNum::Full(val) => *val,
+            CompressedNum::FixedPoint1s31(val) => 
+                CompressedNum::from_fixed_point_1s31(*val),
+            CompressedNum::Trinary(val) => 
+                CompressedNum::from_trinary(*val),
+        }).collect::<Vec<f32>>(), 
+        crate::core::data_types::VectorConversionType::Full)
     }
 
     fn scalar_compute(
@@ -106,18 +167,51 @@ impl FpgaAccelerator {
     ) -> Result<FpgaVector, AcceleratorError> {
         let unit_id = self.select_unit()?;
         
-        let result = match computation_type {
-            ComputationType::Add => input.data.iter().map(|&x| x + 1.0).collect(),
-            ComputationType::Multiply => input.data.iter().map(|&x| x * 2.0).collect(),
-            ComputationType::Tanh => input.data.iter().map(|&x| x.tanh()).collect(),
-            ComputationType::ReLU => input.data.iter().map(|&x| x.max(0.0)).collect(),
+        let result_data: Vec<f32> = match computation_type {
+            ComputationType::Add => input.data.iter()
+                .map(|x| match x {
+                    CompressedNum::Full(val) => val + 1.0,
+                    CompressedNum::FixedPoint1s31(val) => 
+                        CompressedNum::from_fixed_point_1s31(*val) + 1.0,
+                    CompressedNum::Trinary(val) => 
+                        CompressedNum::from_trinary(*val) + 1.0,
+                })
+                .collect(),
+            ComputationType::Multiply => input.data.iter()
+                .map(|x| match x {
+                    CompressedNum::Full(val) => val * 2.0,
+                    CompressedNum::FixedPoint1s31(val) => 
+                        CompressedNum::from_fixed_point_1s31(*val) * 2.0,
+                    CompressedNum::Trinary(val) => 
+                        CompressedNum::from_trinary(*val) * 2.0,
+                })
+                .collect(),
+            ComputationType::Tanh => input.data.iter()
+                .map(|x| match x {
+                    CompressedNum::Full(val) => val.tanh(),
+                    CompressedNum::FixedPoint1s31(val) => 
+                        CompressedNum::from_fixed_point_1s31(*val).tanh(),
+                    CompressedNum::Trinary(val) => 
+                        CompressedNum::from_trinary(*val).tanh(),
+                })
+                .collect(),
+            ComputationType::ReLU => input.data.iter()
+                .map(|x| match x {
+                    CompressedNum::Full(val) => val.max(0.0),
+                    CompressedNum::FixedPoint1s31(val) => 
+                        CompressedNum::from_fixed_point_1s31(*val).max(0.0),
+                    CompressedNum::Trinary(val) => 
+                        CompressedNum::from_trinary(*val).max(0.0),
+                })
+                .collect(),
             _ => return Err(AcceleratorError::UnsupportedComputationType(
                 format!("Unsupported computation type: {:?}", computation_type)
             )),
         };
 
         self.release_unit(unit_id);
-        FpgaVector::new(result)
+        FpgaVector::from_numpy(&result_data, 
+            crate::core::data_types::VectorConversionType::Full)
     }
 
     fn select_unit(&mut self) -> Result<usize, AcceleratorError> {
@@ -134,31 +228,6 @@ impl FpgaAccelerator {
         if unit_id < self.total_units {
             self.available_units[unit_id] = true;
         }
-    }
-}
-
-// トレイト: 計算入力の抽象化
-pub trait ComputeInput {
-    fn as_vector(&self) -> Option<&FpgaVector>;
-    fn as_matrix(&self) -> Option<&FpgaMatrix>;
-}
-
-// 実装例
-impl ComputeInput for FpgaVector {
-    fn as_vector(&self) -> Option<&FpgaVector> {
-        Some(self)
-    }
-    fn as_matrix(&self) -> Option<&FpgaMatrix> {
-        None
-    }
-}
-
-impl ComputeInput for FpgaMatrix {
-    fn as_vector(&self) -> Option<&FpgaVector> {
-        None
-    }
-    fn as_matrix(&self) -> Option<&FpgaMatrix> {
-        Some(self)
     }
 }
 

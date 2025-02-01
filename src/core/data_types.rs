@@ -6,8 +6,8 @@ use std::ops::{Add, Mul};
 pub enum CompressedNum {
     /// 三値化表現: 0（ゼロ）, 1（正）, 2（負）
     Trinary(u8),
-    /// 固定小数点数（8ビット整数部, 24ビット小数部）
-    FixedPoint(i32),
+    /// 1s.31形式の固定小数点数（1ビット符号、31ビット小数部）
+    FixedPoint1s31(i32),
     /// 完全な浮動小数点数
     Full(f32),
 }
@@ -24,20 +24,19 @@ impl CompressedNum {
         }
     }
 
-    /// 浮動小数点数を固定小数点数に変換
-    pub fn to_fixed_point(value: f32) -> Self {
-        // 8ビット整数部, 24ビット小数部
-        // スケーリングと丸めを行う
-        const FRACTIONAL_BITS: i32 = 24;
-        const SCALE: f32 = (1 << FRACTIONAL_BITS) as f32;
+    /// 浮動小数点数を1s.31形式の固定小数点数に変換
+    pub fn to_fixed_point_1s31(value: f32) -> Self {
+        // 1s.31形式: 1ビット符号、31ビット小数部
+        const FRACTIONAL_BITS: i32 = 31;
+        const SCALE: f64 = (1i64 << FRACTIONAL_BITS) as f64;
         
-        // オーバーフロー/アンダーフロー対策
-        let clamped = value.max(-128.0).min(127.0);
+        // クランプ処理（-1.0 から 1.0 の間に制限）
+        let clamped = value.max(-1.0).min(1.0);
         
         // 固定小数点数への変換
-        let fixed = (clamped * SCALE).round() as i32;
+        let fixed = (clamped as f64 * SCALE).round() as i32;
         
-        CompressedNum::FixedPoint(fixed)
+        CompressedNum::FixedPoint1s31(fixed)
     }
 
     /// 三値化された値を浮動小数点数に戻す
@@ -50,12 +49,12 @@ impl CompressedNum {
         }
     }
 
-    /// 固定小数点数を浮動小数点数に戻す
-    pub fn from_fixed_point(fixed: i32) -> f32 {
-        const FRACTIONAL_BITS: i32 = 24;
-        const SCALE: f32 = (1 << FRACTIONAL_BITS) as f32;
+    /// 1s.31形式の固定小数点数を浮動小数点数に戻す
+    pub fn from_fixed_point_1s31(fixed: i32) -> f32 {
+        const FRACTIONAL_BITS: i32 = 31;
+        const SCALE: f64 = (1i64 << FRACTIONAL_BITS) as f64;
         
-        (fixed as f32) / SCALE
+        (fixed as f64 / SCALE) as f32
     }
 }
 
@@ -72,17 +71,49 @@ pub struct FpgaMatrix {
     pub cols: usize,
 }
 
+/// ベクトル変換タイプ
+#[derive(Debug, Clone, Copy)]
+pub enum VectorConversionType {
+    Full,           // 通常の浮動小数点数
+    Trinary,        // 三値化
+    FixedPoint1s31, // 1s.31固定小数点数
+}
+
+/// 行列変換タイプ
+#[derive(Debug, Clone, Copy)]
+pub enum MatrixConversionType {
+    Full,           // 通常の浮動小数点数
+    Trinary,        // 三値化
+    FixedPoint1s31, // 1s.31固定小数点数
+}
+
+/// 計算タイプ列挙型
+#[derive(Debug, Clone, Copy)]
+pub enum ComputationType {
+    Add,
+    Multiply,
+    Tanh,
+    ReLU,
+    MatrixVectorMultiply,
+}
+
 impl FpgaVector {
     /// NumPyベクトルから変換
-    pub fn from_numpy(numpy_vec: &[f32], conversion_type: VectorConversionType) -> Result<Self, crate::error::AcceleratorError> {
+    pub fn from_numpy(
+        numpy_vec: &[f32], 
+        conversion_type: VectorConversionType
+    ) -> Result<Self, crate::error::AcceleratorError> {
         if numpy_vec.len() % 16 != 0 {
             return Err(crate::error::AcceleratorError::InvalidDimension(numpy_vec.len()));
         }
 
         let converted_data = match conversion_type {
-            VectorConversionType::Full => numpy_vec.iter().map(|&x| CompressedNum::Full(x)).collect(),
-            VectorConversionType::Trinary => numpy_vec.iter().map(|&x| CompressedNum::trinarize(x)).collect(),
-            VectorConversionType::FixedPoint => numpy_vec.iter().map(|&x| CompressedNum::to_fixed_point(x)).collect(),
+            VectorConversionType::Full => 
+                numpy_vec.iter().map(|&x| CompressedNum::Full(x)).collect(),
+            VectorConversionType::Trinary => 
+                numpy_vec.iter().map(|&x| CompressedNum::trinarize(x)).collect(),
+            VectorConversionType::FixedPoint1s31 => 
+                numpy_vec.iter().map(|&x| CompressedNum::to_fixed_point_1s31(x)).collect(),
         };
 
         Ok(Self {
@@ -95,7 +126,7 @@ impl FpgaVector {
     pub fn to_numpy(&self) -> Vec<f32> {
         self.data.iter().map(|compressed| match compressed {
             CompressedNum::Trinary(val) => CompressedNum::from_trinary(*val),
-            CompressedNum::FixedPoint(val) => CompressedNum::from_fixed_point(*val),
+            CompressedNum::FixedPoint1s31(val) => CompressedNum::from_fixed_point_1s31(*val),
             CompressedNum::Full(val) => *val,
         }).collect()
     }
@@ -103,7 +134,10 @@ impl FpgaVector {
 
 impl FpgaMatrix {
     /// NumPy行列から変換
-    pub fn from_numpy(numpy_matrix: &[Vec<f32>], conversion_type: MatrixConversionType) -> Result<Self, crate::error::AcceleratorError> {
+    pub fn from_numpy(
+        numpy_matrix: &[Vec<f32>], 
+        conversion_type: MatrixConversionType
+    ) -> Result<Self, crate::error::AcceleratorError> {
         if numpy_matrix.is_empty() || 
            numpy_matrix.len() % 16 != 0 || 
            numpy_matrix[0].len() % 16 != 0 {
@@ -119,9 +153,9 @@ impl FpgaMatrix {
                 numpy_matrix.iter()
                     .map(|row| row.iter().map(|&x| CompressedNum::trinarize(x)).collect())
                     .collect(),
-            MatrixConversionType::FixedPoint => 
+            MatrixConversionType::FixedPoint1s31 => 
                 numpy_matrix.iter()
-                    .map(|row| row.iter().map(|&x| CompressedNum::to_fixed_point(x)).collect())
+                    .map(|row| row.iter().map(|&x| CompressedNum::to_fixed_point_1s31(x)).collect())
                     .collect(),
         };
 
@@ -138,26 +172,49 @@ impl FpgaMatrix {
             .map(|row| 
                 row.iter().map(|compressed| match compressed {
                     CompressedNum::Trinary(val) => CompressedNum::from_trinary(*val),
-                    CompressedNum::FixedPoint(val) => CompressedNum::from_fixed_point(*val),
+                    CompressedNum::FixedPoint1s31(val) => CompressedNum::from_fixed_point_1s31(*val),
                     CompressedNum::Full(val) => *val,
                 }).collect()
             )
             .collect()
     }
-}
 
-/// ベクトル変換タイプ
-#[derive(Debug, Clone, Copy)]
-pub enum VectorConversionType {
-    Full,           // 通常の浮動小数点数
-    Trinary,        // 三値化
-    FixedPoint,     // 固定小数点数
-}
+    /// 大規模行列を16x16ブロックに分割
+    pub fn split_into_blocks(&self, block_size: usize) -> Vec<Vec<FpgaMatrix>> {
+        let mut blocks = Vec::new();
 
-/// 行列変換タイプ
-#[derive(Debug, Clone, Copy)]
-pub enum MatrixConversionType {
-    Full,           // 通常の浮動小数点数
-    Trinary,        // 三値化
-    FixedPoint,     // 固定小数点数
+        for row_start in (0..self.rows).step_by(block_size) {
+            let mut row_blocks = Vec::new();
+            
+            for col_start in (0..self.cols).step_by(block_size) {
+                let mut block_data = Vec::new();
+                
+                for r in row_start..std::cmp::min(row_start + block_size, self.rows) {
+                    let mut block_row = Vec::new();
+                    
+                    for c in col_start..std::cmp::min(col_start + block_size, self.cols) {
+                        block_row.push(self.data[r][c]);
+                    }
+                    
+                    // パディング
+                    while block_row.len() < block_size {
+                        block_row.push(CompressedNum::Full(0.0));
+                    }
+                    
+                    block_data.push(block_row);
+                }
+                
+                // 行のパディング
+                while block_data.len() < block_size {
+                    block_data.push(vec![CompressedNum::Full(0.0); block_size]);
+                }
+                
+                row_blocks.push(FpgaMatrix::new(block_data).unwrap());
+            }
+            
+            blocks.push(row_blocks);
+        }
+        
+        blocks
+    }
 }

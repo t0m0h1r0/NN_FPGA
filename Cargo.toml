@@ -14,7 +14,7 @@ thiserror = "1.0"
 log = "0.4"
 env_logger = "0.10"
 num-traits = "0.2"
-half = "2.2"  # 半精度浮動小数点数サポート
+half = "2.2"
 
 [build-dependencies]
 pyo3-build-config = "0.20"
