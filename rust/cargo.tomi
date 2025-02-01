@@ -2,22 +2,51 @@
 name = "nn_accel"
 version = "0.2.0"
 edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "FPGA-based neural network accelerator interface"
+license = "MIT"
+repository = "https://github.com/yourusername/nn_accel"
 
 [lib]
 name = "nn_accel"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rayon = "1.8"
-numpy = "0.20"
-pyo3 = { version = "0.20", features = ["extension-module", "numpy"] }
-crossbeam = "0.8"
-thiserror = "1.0"
+# Async Runtime
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
 
-[features]
-extension-module = ["pyo3/extension-module"]
-default = ["extension-module"]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+byteorder = "1.4"
+
+# Error Handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Parallel Processing
+rayon = "1.8"
+
+# Python Bindings (Optional)
+pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
+numpy = { version = "0.20", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
+tokio-test = "0.4"
 rand = "0.8"
+
+[features]
+default = []
+python = ["pyo3", "numpy"]
+
+[[bench]]
+name = "compute"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
