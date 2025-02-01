@@ -10,8 +10,7 @@ module accelerator_top
     output logic [15:0] perf_counter,
 
     // データインターフェース
-    input  vector_t data_in [UNIT_COUNT],
-    input  matrix_t matrix_in [UNIT_COUNT],
+    input  matrix_t data_in [UNIT_COUNT],  // 入力データとマトリックスを統合
     output vector_t data_out [UNIT_COUNT]
 );
     // 内部接続信号
@@ -24,9 +23,7 @@ module accelerator_top
     logic compute_ready;
     logic compute_done;
     comp_type_e current_comp_type;
-    vector_t current_vector_a;
-    vector_t current_vector_b;
-    matrix_t current_matrix;
+    matrix_t current_data;
     vector_t compute_result;
 
     // システムコントローラ
@@ -50,9 +47,7 @@ module accelerator_top
         .ready(compute_ready),
         .done(compute_done),
         .comp_type(current_comp_type),
-        .vector_a(current_vector_a),
-        .vector_b(current_vector_b),
-        .matrix_in(current_matrix),
+        .data_in(current_data),
         .result(compute_result)
     );
 
@@ -67,7 +62,6 @@ module accelerator_top
                 .ready(unit_ready[i]),
                 .done(unit_done[i]),
                 .data_in(data_in[i]),
-                .matrix_in(matrix_in[i]),
                 .data_out(data_out[i])
             );
         end
@@ -77,28 +71,15 @@ module accelerator_top
     always_comb begin
         // 共有計算ユニットへのデータ接続
         unit_compute_request = '0;
-        current_vector_a = '0;
-        current_vector_b = '0;
-        current_matrix = '0;
+        current_data = '0;
         current_comp_type = COMP_ADD;
 
         // システムコントローラからの制御に基づいて接続
         if (sys_control[1]) begin  // 計算モード
             unit_compute_request[0] = 1'b1;
-            current_vector_a = data_in[0];
-            current_vector_b = data_in[1];
-            current_matrix = matrix_in[0];
+            current_data = data_in[0];
             current_comp_type = comp_type_e'(sys_control[3:2]);
         end
     end
 
-    // デバッグ用パフォーマンスモニタリング
-    // synthesis translate_off
-    always_ff @(posedge clk) begin
-        if (sys_status[7]) begin  // ビジー状態
-            $display("アクティブ処理ユニット: %b", unit_ready);
-            $display("パフォーマンスカウンタ: %0d サイクル", perf_counter);
-        end
-    end
-    // synthesis translate_on
 endmodule
