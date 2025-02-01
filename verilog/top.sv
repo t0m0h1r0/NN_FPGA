@@ -18,6 +18,17 @@ module top
     control_packet_t [NUM_PROCESSING_UNITS-1:0] unit_control;
     logic [NUM_PROCESSING_UNITS-1:0] unit_ready;
     logic [NUM_PROCESSING_UNITS-1:0] unit_done;
+    
+    // 共有演算ユニット用信号
+    logic [1:0] current_unit_id;
+    logic [NUM_PROCESSING_UNITS-1:0] unit_compute_request;
+    logic compute_ready;
+    logic compute_done;
+    computation_type_t current_comp_type;
+    vector_data_t current_vector_a;
+    vector_data_t current_vector_b;
+    matrix_data_t current_matrix;
+    vector_data_t compute_result;
 
     // システムコントローラのインスタンス化
     control u_control (
@@ -31,15 +42,34 @@ module top
         .perf_counter(perf_counter)
     );
 
+    // 共有演算ユニット
+    shared_compute_unit u_compute (
+        .clk(clk),
+        .rst_n(rst_n),
+        .unit_id(current_unit_id),
+        .request(compute_request),
+        .ready(compute_ready),
+        .done(compute_done),
+        .comp_type(current_comp_type),
+        .vector_a(current_vector_a),
+        .vector_b(current_vector_b),
+        .matrix_in(current_matrix),
+        .result(compute_result)
+    );
+
     // 処理ユニットの生成
     generate
         for (genvar i = 0; i < NUM_PROCESSING_UNITS; i++) begin : gen_units
             unit u_unit (
                 .clk(clk),
                 .rst_n(rst_n),
+                .unit_id(i[1:0]),
                 .control(unit_control[i]),
                 .ready(unit_ready[i]),
                 .done(unit_done[i]),
+                .compute_request(unit_compute_request[i]),
+                .compute_ready(compute_ready),
+                .compute_done(compute_done && current_unit_id == i[1:0]),
                 .data_in(data_in[i]),
                 .matrix_in(matrix_in[i]),
                 .data_out(data_out[i])
