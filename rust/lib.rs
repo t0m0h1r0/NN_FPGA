@@ -1,94 +1,176 @@
-//! Neural Network Accelerator Library
+//! Neural network accelerator library
 //!
-//! This library provides a high-performance interface to FPGA-based
-//! neural network acceleration hardware.
+//! This library provides a high-level interface for interacting with FPGA-based
+//! neural network acceleration hardware. It supports efficient vector operations,
+//! parallel processing, and hardware resource management.
 //!
 //! # Architecture
 //!
-//! The library is organized into several main components:
+//! The library is organized into three main layers:
 //!
-//! - Core types and operations (`core` module)
-//! - Hardware interface layer (`hw` module)
-//! - High-level APIs (`api` module)
+//! - Domain layer: Core types and business logic
+//! - Hardware layer: FPGA and memory management
+//! - Application layer: High-level operations and monitoring
 //!
 //! # Example
 //!
 //! ```rust,no_run
 //! use nn_accel::{
 //!     Accelerator, Vector,
-//!     types::{UnitId, Activation},
+//!     operation::{Operation, UnitId},
 //!     error::Result,
 //! };
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
 //!     // Initialize accelerator
-//!     let accelerator = Accelerator::new_mock();
-//!     accelerator.initialize().await?;
+//!     let mut accelerator = Accelerator::new().await?;
 //!
-//!     // Create and initialize vectors
+//!     // Create and initialize vector
 //!     let mut vec1 = Vector::new(32)?;
-//!     let mut vec2 = Vector::new(32)?;
-//!
 //!     vec1.bind_to_unit(UnitId::new(0).unwrap()).await?;
-//!     vec2.bind_to_unit(UnitId::new(1).unwrap()).await?;
 //!
-//!     // Perform operations
-//!     accelerator.copy(&vec1, &mut vec2).await?;
-//!     accelerator.add(&vec1, &mut vec2).await?;
-//!     accelerator.activate(&mut vec2, Activation::ReLU).await?;
+//!     // Execute operation
+//!     accelerator.execute(
+//!         Operation::Copy { source: UnitId::new(1).unwrap() },
+//!         vec1.unit_id().unwrap()
+//!     ).await?;
 //!
 //!     Ok(())
 //! }
 //! ```
 
-pub mod core {
+// Domain layer modules
+pub mod domain {
+    mod compute;
     mod types;
     mod error;
-    mod compute;
 
-    pub use self::types::*;
-    pub use self::error::*;
-    pub use self::compute::*;
+    pub use compute::Vector;
+    pub use types::{Operation, UnitId, OperationStatus};
+    pub use error::{Result, Error};
+
+    // Re-export common types for convenience
+    pub mod prelude {
+        pub use super::{Vector, Operation, UnitId, OperationStatus, Result, Error};
+    }
 }
 
+// Hardware interface modules
 pub mod hw {
     mod fpga;
-    mod unit;
-    mod protocol;
+    mod memory;
 
-    pub(crate) use self::fpga::*;
-    pub(crate) use self::unit::*;
-    pub(crate) use self::protocol::*;
+    pub(crate) use fpga::{FpgaInterface, RealFpga, MockFpga, FpgaConfig};
+    pub(crate) use memory::{MemoryManager, MemoryUsage};
 }
 
-pub mod api {
-    mod async_api;
-    #[cfg(feature = "python")]
-    mod python;
+// Application layer modules
+pub mod app {
+    mod executor;
+    mod scheduler;
+    mod monitor;
 
-    pub use self::async_api::*;
-    #[cfg(feature = "python")]
-    pub use self::python::*;
+    pub(crate) use executor::Executor;
+    pub(crate) use scheduler::Scheduler;
+    pub(crate) use monitor::Monitor;
+}
+
+// Public interface modules
+pub mod interface {
+    mod rest;
+
+    pub use rest::{create_router, AppState};
 }
 
 // Re-export commonly used types
-pub use core::{
-    types::{UnitId, Operation, Activation, VectorBlock, Status},
-    error::{Result, AccelError},
-    compute::Vector,
-};
+pub use domain::{Vector, Operation, UnitId, OperationStatus, Result, Error};
 
-pub use api::{
-    AsyncAccelerator,
-    Accelerator,
-};
+/// Main accelerator interface
+pub struct Accelerator {
+    executor: std::sync::Arc<app::Executor>,
+    scheduler: std::sync::Arc<app::Scheduler>,
+    monitor: std::sync::Arc<app::Monitor>,
+}
 
-/// Create mock accelerator for testing
-pub fn create_mock_accelerator() -> Accelerator {
-    use hw::{fpga::MockFpga, unit::UnitManager};
-    let unit_manager = UnitManager::new(Box::new(MockFpga::default()));
-    Accelerator::new(unit_manager)
+impl Accelerator {
+    /// Create new accelerator instance
+    pub async fn new() -> Result<Self> {
+        // Initialize components with default configuration
+        let fpga = Box::new(hw::RealFpga::new());
+        let memory = std::sync::Arc::new(hw::MemoryManager::new(1024 * 1024, 16)?);
+        
+        let executor = std::sync::Arc::new(
+            app::Executor::new(fpga, memory.clone())
+        );
+        
+        let scheduler = std::sync::Arc::new(
+            app::Scheduler::new(executor.clone())
+        );
+        
+        let monitor = std::sync::Arc::new(
+            app::Monitor::new(
+                memory,
+                scheduler.clone(),
+            )
+        );
+
+        // Start monitor
+        monitor.start().await?;
+
+        Ok(Self {
+            executor,
+            scheduler,
+            monitor,
+        })
+    }
+
+    /// Create accelerator with mock FPGA for testing
+    pub fn new_mock() -> Self {
+        let fpga = Box::new(hw::MockFpga::default());
+        let memory = std::sync::Arc::new(
+            hw::MemoryManager::new(1024, 16).unwrap()
+        );
+
+        let executor = std::sync::Arc::new(
+            app::Executor::new(fpga, memory.clone())
+        );
+        
+        let scheduler = std::sync::Arc::new(
+            app::Scheduler::new(executor.clone())
+        );
+        
+        let monitor = std::sync::Arc::new(
+            app::Monitor::new(
+                memory,
+                scheduler.clone(),
+            )
+        );
+
+        Self {
+            executor,
+            scheduler,
+            monitor,
+        }
+    }
+
+    /// Execute operation on unit
+    pub async fn execute(&self, operation: Operation, unit: UnitId) -> Result<OperationStatus> {
+        self.executor.execute(operation, unit).await
+    }
+
+    /// Get system status
+    pub async fn status(&self) -> Result<app::monitor::SystemStatus> {
+        self.monitor.status().await
+    }
+
+    /// Create REST API router
+    pub fn create_router(&self) -> axum::Router {
+        interface::create_router(
+            self.scheduler.clone(),
+            self.monitor.clone(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -97,25 +179,25 @@ mod tests {
     use tokio::runtime::Runtime;
 
     #[test]
-    fn test_mock_accelerator() {
+    fn test_accelerator() {
         let rt = Runtime::new().unwrap();
         
         rt.block_on(async {
-            let accelerator = create_mock_accelerator();
+            // Test mock accelerator
+            let accelerator = Accelerator::new_mock();
             
-            // Test initialization
-            assert!(accelerator.initialize().await.is_ok());
+            let unit = UnitId::new(0).unwrap();
+            let op = Operation::Copy {
+                source: UnitId::new(1).unwrap(),
+            };
             
-            // Test vector operations
-            let mut vec1 = Vector::new(32).unwrap();
-            let mut vec2 = Vector::new(32).unwrap();
-            
-            vec1.bind_to_unit(UnitId::new(0).unwrap()).await.unwrap();
-            vec2.bind_to_unit(UnitId::new(1).unwrap()).await.unwrap();
-            
-            assert!(accelerator.copy(&vec1, &mut vec2).await.is_ok());
-            assert!(accelerator.add(&vec1, &mut vec2).await.is_ok());
-            assert!(accelerator.activate(&mut vec2, Activation::ReLU).await.is_ok());
+            let status = accelerator.execute(op, unit).await.unwrap();
+            assert!(matches!(status, OperationStatus::Success));
+
+            // Create and test vector
+            let mut vec = Vector::new(32).unwrap();
+            vec.bind_to_unit(unit).await.unwrap();
+            assert_eq!(vec.size(), 32);
         });
     }
 }
