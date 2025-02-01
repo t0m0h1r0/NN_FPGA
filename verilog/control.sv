@@ -18,7 +18,7 @@ module control
     // パフォーマンスモニタリング
     output logic [15:0] perf_counter
 );
-    // システム状態の定義（簡素化）
+    // システム状態の定義
     typedef enum logic [2:0] {
         ST_IDLE,
         ST_INIT,
@@ -43,11 +43,11 @@ module control
             
             // ステート遷移
             case (current_state)
-                ST_IDLE: handle_idle_state();
-                ST_INIT: handle_init_state();
+                ST_IDLE:     handle_idle_state();
+                ST_INIT:     handle_init_state();
                 ST_DISPATCH: handle_dispatch_state();
-                ST_EXECUTE: handle_execute_state();
-                ST_SYNC: handle_sync_state();
+                ST_EXECUTE:  handle_execute_state();
+                ST_SYNC:     handle_sync_state();
             endcase
 
             // ステータス更新

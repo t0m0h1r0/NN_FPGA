@@ -43,59 +43,71 @@ module unit
         .error_status(error_status)
     );
 
-    // 内部状態と制御レジスタ
-    logic compute_active;
-    vector_data_t computed_vector;
-    matrix_data_t stored_matrix;
+    // 内部状態と作業レジスタ
+    logic compute_in_progress;
+    vector_data_t temp_vector;
+    matrix_data_t temp_matrix;
 
     // 状態遷移と制御ロジック
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            // リセット時の初期化
             reset_unit();
         end
         else begin
-            // エラー処理
+            // エラー処理を最優先
             if (|error_status) begin
-                reset_unit();
+                handle_error();
                 return;
             end
 
             // メイン状態遷移
-            case (decoded_control.op_code)
-                OP_NOP: handle_nop_operation();
-                OP_LOAD: handle_load_operation();
-                OP_STORE: handle_store_operation();
-                OP_COMP: handle_compute_operation();
-            endcase
+            if (decode_valid) begin
+                case (decoded_control.op_code)
+                    OP_NOP:    handle_nop();
+                    OP_LOAD:   handle_load();
+                    OP_STORE:  handle_store();
+                    OP_COMP:   handle_compute();
+                endcase
+            end
         end
     end
 
-    // タスク：ユニットのリセット
+    // ユニットリセットタスク
     task reset_unit();
         ready <= 1'b1;
         done <= 1'b0;
         mem_request <= 1'b0;
-        compute_active <= 1'b0;
+        compute_in_progress <= 1'b0;
         data_out <= '0;
+        vec_index <= '0;
+        mat_row <= '0;
+        mat_col <= '0;
+        mem_op_type <= '0;
     endtask
 
-    // タスク：NOP操作の処理
-    task handle_nop_operation();
+    // エラー処理タスク
+    task handle_error();
+        reset_unit();
+        // エラーログや追加のエラー処理が必要な場合はここに追加
+    endtask
+
+    // NOP処理タスク
+    task handle_nop();
+        // NOP時は何もしない
         ready <= 1'b1;
         done <= 1'b0;
     endtask
 
-    // タスク：ロード操作の処理
-    task handle_load_operation();
-        if (decode_valid && !mem_request) begin
+    // ロード処理タスク
+    task handle_load();
+        if (!mem_request) begin
             ready <= 1'b0;
             mem_request <= 1'b1;
             mem_op_type <= 4'b0001;  // Load操作
             vec_index <= decoded_control.addr;
         end
         
-        if (mem_done) begin
+        if (mem_done && mem_request) begin
             data_out <= read_data;
             mem_request <= 1'b0;
             done <= 1'b1;
@@ -103,9 +115,9 @@ module unit
         end
     endtask
 
-    // タスク：ストア操作の処理
-    task handle_store_operation();
-        if (decode_valid && !mem_request) begin
+    // ストア処理タスク
+    task handle_store();
+        if (!mem_request) begin
             ready <= 1'b0;
             mem_request <= 1'b1;
             mem_op_type <= 4'b0010;  // Store操作
@@ -113,36 +125,36 @@ module unit
             write_data <= data_in;
         end
         
-        if (mem_done) begin
+        if (mem_done && mem_request) begin
             mem_request <= 1'b0;
             done <= 1'b1;
             ready <= 1'b1;
         end
     endtask
 
-    // タスク：計算操作の処理
-    task handle_compute_operation();
-        if (decode_valid && !compute_active) begin
+    // 計算処理タスク
+    task handle_compute();
+        if (!compute_in_progress) begin
             ready <= 1'b0;
-            compute_active <= 1'b1;
-            stored_matrix <= matrix_in;
+            compute_in_progress <= 1'b1;
+            temp_matrix <= matrix_in;
             mem_request <= 1'b1;
             mem_op_type <= 4'b0100;  // Compute操作
         end
         
-        if (mem_done) begin
-            computed_vector <= read_data;
+        if (mem_done && mem_request) begin
+            temp_vector <= read_data;
             mem_request <= 1'b0;
             
             // 計算タイプに応じた演算
             case (decoded_control.comp_type)
-                COMP_ADD: perform_addition();
-                COMP_MUL: perform_matrix_multiplication();
+                COMP_ADD:  perform_addition();
+                COMP_MUL:  perform_matrix_multiplication();
                 COMP_TANH: perform_tanh_activation();
                 COMP_RELU: perform_relu_activation();
             endcase
 
-            compute_active <= 1'b0;
+            compute_in_progress <= 1'b0;
             done <= 1'b1;
             ready <= 1'b1;
         end
@@ -151,7 +163,7 @@ module unit
     // 各演算タスク
     task perform_addition();
         for (int i = 0; i < VECTOR_DEPTH; i++) begin
-            data_out.data[i] <= computed_vector.data[i] + read_data.data[i];
+            data_out.data[i] <= temp_vector.data[i] + read_data.data[i];
         end
     endtask
 
@@ -159,9 +171,9 @@ module unit
         for (int i = 0; i < VECTOR_DEPTH; i++) begin
             logic [VECTOR_WIDTH-1:0] sum = '0;
             for (int j = 0; j < MATRIX_DEPTH; j++) begin
-                if (stored_matrix.data[i][j][0]) begin
-                    sum += stored_matrix.data[i][j][1] ? 
-                        -computed_vector.data[j] : computed_vector.data[j];
+                if (temp_matrix.data[i][j][0]) begin
+                    sum += temp_matrix.data[i][j][1] ? 
+                        -temp_vector.data[j] : temp_vector.data[j];
                 end
             end
             data_out.data[i] <= sum;
@@ -170,7 +182,7 @@ module unit
 
     task perform_tanh_activation();
         for (int i = 0; i < VECTOR_DEPTH; i++) begin
-            data_out.data[i] <= computed_vector.data[i][VECTOR_WIDTH-1] ? 
+            data_out.data[i] <= temp_vector.data[i][VECTOR_WIDTH-1] ? 
                 {1'b1, {(VECTOR_WIDTH-1){1'b0}}} :
                 {1'b0, {(VECTOR_WIDTH-1){1'b1}}};
         end
@@ -178,8 +190,8 @@ module unit
 
     task perform_relu_activation();
         for (int i = 0; i < VECTOR_DEPTH; i++) begin
-            data_out.data[i] <= computed_vector.data[i][VECTOR_WIDTH-1] ? 
-                '0 : computed_vector.data[i];
+            data_out.data[i] <= temp_vector.data[i][VECTOR_WIDTH-1] ? 
+                '0 : temp_vector.data[i];
         end
     endtask
 
@@ -187,7 +199,7 @@ module unit
     // synthesis translate_off
     always @(posedge clk) begin
         if (|error_status) begin
-            $display("Unit %0d Error: state=%0d, error=0x%h", 
+            $display("Unit %0d Error: op_code=%0d, error_status=0x%h", 
                     unit_id, decoded_control.op_code, error_status);
         end
     end

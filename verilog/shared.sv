@@ -1,4 +1,4 @@
-// shared_compute_unit.sv
+// shared.sv
 module shared_compute_unit
     import accel_pkg::*;
 (
@@ -104,4 +104,14 @@ module shared_compute_unit
         // 演算完了時かつ要求元ユニットが一致する場合のみ結果を出力
         result = (done && current_unit == unit_id) ? result : '0;
     end
+
+    // デバッグ用モニタリング
+    // synthesis translate_off
+    always @(posedge clk) begin
+        if (processing) begin
+            $display("共有計算ユニット: unit_id=%0d, comp_type=%0d, counter=%0d", 
+                     current_unit, comp_type, compute_counter);
+        end
+    end
+    // synthesis translate_on
 endmodule

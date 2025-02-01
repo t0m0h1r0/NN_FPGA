@@ -28,28 +28,25 @@ module memory_controller
     input  logic mem_busy,
     input  logic [1:0] mem_error
 );
-    // 内部状態定義
+    // 内部状態定義（簡素化）
     typedef enum logic [2:0] {
-        IDLE,
-        ARBITRATE,
-        READ_SETUP,
-        READ_WAIT,
-        WRITE_SETUP,
-        WRITE_EXECUTE,
-        ERROR_HANDLE,
-        COMPLETE
+        ST_IDLE,
+        ST_ARBITRATE,
+        ST_ACCESS,
+        ST_COMPLETE,
+        ST_ERROR
     } ctrl_state_t;
 
+    // 内部信号
     ctrl_state_t current_state;
     logic [1:0] selected_unit;
-    logic [3:0] operation_type;
-    logic [3:0] access_counter;
-    logic [3:0] priority_rotate;
-
-    // アドレス生成インスタンス
+    logic [3:0] priority_mask;
+    
+    // アドレス生成
     logic [5:0] vector_addr;
     logic [7:0] matrix_addr;
     
+    // アドレス生成モジュールのインスタンス化
     memory_address_generator addr_gen (
         .unit_id(selected_unit),
         .vector_index(unit_vec_index[selected_unit]),
@@ -59,141 +56,134 @@ module memory_controller
         .matrix_addr(matrix_addr)
     );
 
-    // 優先順位に基づくユニット選択
-    function automatic logic [1:0] get_next_unit;
-        input logic [3:0] requests;
-        input logic [3:0] priority;
-        logic [3:0] masked_requests;
-        logic [3:0] rotated_requests;
-        logic [1:0] selected;
+    // 優先順位に基づくユニット選択関数
+    function automatic logic [1:0] select_next_unit(
+        input logic [3:0] requests,
+        input logic [3:0] priority_mask
+    );
+        logic [3:0] masked_requests = requests & priority_mask;
         
-        // 優先順位でマスクされた要求を生成
-        masked_requests = requests & priority;
-        if (|masked_requests) begin
-            // マスクされた要求から最も優先度の高いものを選択
-            casez (masked_requests)
-                4'b???1: selected = 2'd0;
-                4'b??10: selected = 2'd1;
-                4'b?100: selected = 2'd2;
-                4'b1000: selected = 2'd3;
-                default: selected = 2'd0;
-            endcase
-        end
-        else begin
-            // マスクされた要求がない場合は通常の要求から選択
-            casez (requests)
-                4'b???1: selected = 2'd0;
-                4'b??10: selected = 2'd1;
-                4'b?100: selected = 2'd2;
-                4'b1000: selected = 2'd3;
-                default: selected = 2'd0;
-            endcase
-        end
-        return selected;
+        // 優先度の高いユニットから順に選択
+        unique case (1'b1)
+            masked_requests[0]: return 2'd0;
+            masked_requests[1]: return 2'd1;
+            masked_requests[2]: return 2'd2;
+            masked_requests[3]: return 2'd3;
+            default: return 2'd0;
+        endcase
     endfunction
 
     // メインステートマシン
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            current_state <= IDLE;
-            selected_unit <= 2'b00;
-            operation_type <= 4'b0000;
-            access_counter <= 4'b0000;
-            priority_rotate <= 4'b0001;
-            unit_grant <= 4'b0000;
-            unit_done <= 4'b0000;
-            mem_we_a <= 1'b0;
-            mem_we_b <= 1'b0;
+            // リセット時の初期化
+            reset_controller();
         end
         else begin
-            case (current_state)
-                IDLE: begin
-                    if (|unit_request) begin
-                        current_state <= ARBITRATE;
-                        unit_done <= 4'b0000;
-                    end
-                end
-
-                ARBITRATE: begin
-                    selected_unit <= get_next_unit(unit_request, priority_rotate);
-                    operation_type <= unit_op_type[selected_unit];
-                    access_counter <= 4'b0000;
-                    // 優先順位の更新
-                    priority_rotate <= {priority_rotate[2:0], priority_rotate[3]};
-                    current_state <= READ_SETUP;
-                end
-
-                READ_SETUP: begin
-                    mem_addr_a <= vector_addr;
-                    mem_addr_b <= matrix_addr;
-                    unit_grant[selected_unit] <= 1'b1;
-                    mem_we_a <= 1'b0;
-                    mem_we_b <= 1'b0;
-                    if (!mem_busy) begin
-                        current_state <= READ_WAIT;
-                    end
-                end
-
-                READ_WAIT: begin
-                    if (operation_type[3]) begin
-                        // 書き込み操作の場合
-                        current_state <= WRITE_SETUP;
-                    end
-                    else begin
-                        // 読み出し操作の場合
-                        unit_read_data[selected_unit] <= mem_rdata_a;
-                        current_state <= COMPLETE;
-                    end
-                end
-
-                WRITE_SETUP: begin
-                    mem_we_a <= 1'b1;
-                    mem_wdata_a <= unit_write_data[selected_unit].data[access_counter];
-                    current_state <= WRITE_EXECUTE;
-                end
-
-                WRITE_EXECUTE: begin
-                    if (!mem_busy) begin
-                        if (access_counter == 4'hF) begin
-                            current_state <= COMPLETE;
-                        end
-                        else begin
-                            access_counter <= access_counter + 1;
-                            current_state <= WRITE_SETUP;
-                        end
-                    end
-                end
-
-                ERROR_HANDLE: begin
-                    // エラー処理
-                    unit_grant <= 4'b0000;
-                    current_state <= IDLE;
-                end
-
-                COMPLETE: begin
-                    unit_grant[selected_unit] <= 1'b0;
-                    unit_done[selected_unit] <= 1'b1;
-                    current_state <= IDLE;
-                end
-
-                default: current_state <= IDLE;
-            endcase
-
-            // エラー検出時の処理
+            // メモリエラー処理
             if (|mem_error) begin
-                current_state <= ERROR_HANDLE;
+                current_state <= ST_ERROR;
             end
+            
+            // メインステート遷移
+            case (current_state)
+                ST_IDLE: handle_idle_state();
+                ST_ARBITRATE: handle_arbitrate_state();
+                ST_ACCESS: handle_access_state();
+                ST_COMPLETE: handle_complete_state();
+                ST_ERROR: handle_error_state();
+            endcase
         end
     end
 
-    // synthesis translate_off
+    // 各状態のハンドリングタスク
+    task reset_controller();
+        current_state <= ST_IDLE;
+        unit_grant <= '0;
+        unit_done <= '0;
+        priority_mask <= 4'b0001;  // 初期優先順位
+        mem_we_a <= 1'b0;
+        mem_we_b <= 1'b0;
+    endtask
+
+    task handle_idle_state();
+        if (|unit_request) begin
+            current_state <= ST_ARBITRATE;
+            unit_done <= '0;
+        end
+    endtask
+
+    task handle_arbitrate_state();
+        // ユニットの選択と優先順位の更新
+        selected_unit <= select_next_unit(unit_request, priority_mask);
+        priority_mask <= {priority_mask[2:0], priority_mask[3]};
+        current_state <= ST_ACCESS;
+    endtask
+
+    task handle_access_state();
+        // メモリアドレスと操作の設定
+        mem_addr_a <= vector_addr;
+        mem_addr_b <= matrix_addr;
+        
+        // ユニット固有の操作
+        case (unit_op_type[selected_unit])
+            4'b0001: handle_load_operation();  // Load
+            4'b0010: handle_store_operation();  // Store
+            4'b0100: handle_compute_operation();  // Compute
+            default: current_state <= ST_IDLE;
+        endcase
+    endtask
+
+    task handle_load_operation();
+        mem_we_a <= 1'b0;
+        mem_we_b <= 1'b0;
+        unit_grant[selected_unit] <= 1'b1;
+        
+        if (!mem_busy) begin
+            unit_read_data[selected_unit] <= mem_rdata_a;
+            current_state <= ST_COMPLETE;
+        end
+    endtask
+
+    task handle_store_operation();
+        mem_we_a <= 1'b1;
+        mem_wdata_a <= unit_write_data[selected_unit].data[0];  // 最初の要素のみ
+        unit_grant[selected_unit] <= 1'b1;
+        
+        if (!mem_busy) begin
+            current_state <= ST_COMPLETE;
+        end
+    endtask
+
+    task handle_compute_operation();
+        // コンピュート操作の基本的なハンドリング
+        mem_we_a <= 1'b0;
+        unit_grant[selected_unit] <= 1'b1;
+        
+        if (!mem_busy) begin
+            current_state <= ST_COMPLETE;
+        end
+    endtask
+
+    task handle_complete_state();
+        // アクセス完了処理
+        unit_grant[selected_unit] <= 1'b0;
+        unit_done[selected_unit] <= 1'b1;
+        current_state <= ST_IDLE;
+    endtask
+
+    task handle_error_state();
+        // エラー時のリセット処理
+        reset_controller();
+    endtask
+
     // デバッグ用モニタリング
+    // synthesis translate_off
     always @(posedge clk) begin
-        if (current_state == ERROR_HANDLE) begin
+        if (current_state == ST_ERROR) begin
             $display("Memory Controller Error: Unit=%0d, Error=0x%0h", 
                     selected_unit, mem_error);
         end
     end
     // synthesis translate_on
-
 endmodule

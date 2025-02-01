@@ -19,11 +19,13 @@ module status_control
         end
         else begin
             if (start && !busy) begin
+                // 新しい処理の開始
                 busy <= 1'b1;
                 done <= 1'b0;
                 counter <= '0;
             end
             else if (busy) begin
+                // カウンタの更新とステータス管理
                 if (counter == max_count) begin
                     busy <= 1'b0;
                     done <= 1'b1;
@@ -50,8 +52,10 @@ module vector_alu
     input  logic [VECTOR_WIDTH-1:0] b,
     output logic [VECTOR_WIDTH-1:0] result
 );
+    // 乗算結果用の内部信号
     logic signed [2*VECTOR_WIDTH-1:0] mult_result;
     
+    // 演算タイプに応じた結果の生成
     always_comb begin
         case (op_type)
             COMP_ADD: result = a + b;

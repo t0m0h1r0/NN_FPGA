@@ -47,7 +47,7 @@ module top
         .clk(clk),
         .rst_n(rst_n),
         .unit_id(current_unit_id),
-        .request(compute_request),
+        .request(unit_compute_request[current_unit_id]),
         .ready(compute_ready),
         .done(compute_done),
         .comp_type(current_comp_type),
@@ -67,9 +67,6 @@ module top
                 .control(unit_control[i]),
                 .ready(unit_ready[i]),
                 .done(unit_done[i]),
-                .compute_request(unit_compute_request[i]),
-                .compute_ready(compute_ready),
-                .compute_done(compute_done && current_unit_id == i[1:0]),
                 .data_in(data_in[i]),
                 .matrix_in(matrix_in[i]),
                 .data_out(data_out[i])
@@ -81,10 +78,9 @@ module top
     // synthesis translate_off
     always_ff @(posedge clk) begin
         if (sys_status[7]) begin  // ビジー状態
-            $display("Time=%0t: Active processing units: %b", $time, unit_ready);
-            $display("Performance counter: %0d cycles", perf_counter);
+            $display("アクティブ処理ユニット: %b", unit_ready);
+            $display("パフォーマンスカウンタ: %0d サイクル", perf_counter);
         end
     end
     // synthesis translate_on
-
 endmodule

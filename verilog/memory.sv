@@ -45,7 +45,7 @@ module shared_memory_unit
                 error_status[1] <= 1'b0;
                 if (we_a) begin
                     vector_mem[addr_a] <= data_in_a;
-                    data_out_a <= data_in_a;  // write-through behavior
+                    data_out_a <= data_in_a;  // write-through動作
                 end
                 else begin
                     data_out_a <= vector_mem[addr_a];
@@ -69,7 +69,7 @@ module shared_memory_unit
                 error_status[0] <= 1'b0;
                 if (we_b) begin
                     matrix_mem[addr_b] <= data_in_b;
-                    data_out_b <= data_in_b;  // write-through behavior
+                    data_out_b <= data_in_b;  // write-through動作
                 end
                 else begin
                     data_out_b <= matrix_mem[addr_b];
@@ -88,8 +88,25 @@ module shared_memory_unit
         end
     end
 
-    // synthesis translate_off
+    // アドレス生成モジュール
+    module memory_address_generator
+    (
+        input  logic [1:0] unit_id,
+        input  logic [3:0] vector_index,
+        input  logic [3:0] matrix_row,
+        input  logic [3:0] matrix_col,
+        output logic [5:0] vector_addr,
+        output logic [7:0] matrix_addr
+    );
+        // ユニットIDとベクトルインデックスからベクトルアドレスを生成
+        assign vector_addr = {unit_id, vector_index};
+
+        // 行と列から行列アドレスを生成
+        assign matrix_addr = {matrix_row, matrix_col};
+    endmodule
+
     // シミュレーション用の初期化と検証
+    // synthesis translate_off
     initial begin
         for (int i = 0; i < 64; i++) begin
             vector_mem[i] = '0;
@@ -102,31 +119,11 @@ module shared_memory_unit
     // メモリアクセス違反の検出
     always @(posedge clk) begin
         if (we_a && addr_a_error) begin
-            $display("Warning: Vector memory address out of range: %0d", addr_a);
+            $display("警告: ベクトルメモリアドレスが範囲外: %0d", addr_a);
         end
         if (we_b && addr_b_error) begin
-            $display("Warning: Matrix memory address out of range: %0d", addr_b);
+            $display("警告: 行列メモリアドレスが範囲外: %0d", addr_b);
         end
     end
     // synthesis translate_on
-
-endmodule
-
-// メモリアドレス生成モジュール
-module memory_address_generator
-    import accel_pkg::*;
-(
-    input  logic [1:0] unit_id,
-    input  logic [3:0] vector_index,
-    input  logic [3:0] matrix_row,
-    input  logic [3:0] matrix_col,
-    output logic [5:0] vector_addr,
-    output logic [7:0] matrix_addr
-);
-    // ユニットIDとベクトルインデックスからベクトルアドレスを生成
-    assign vector_addr = {unit_id, vector_index};
-
-    // 行と列から行列アドレスを生成
-    assign matrix_addr = {matrix_row, matrix_col};
-
 endmodule
