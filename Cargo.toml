@@ -1,0 +1,20 @@
+[package]
+name = "fpga-accelerator"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fpga_accelerator"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module"] }
+numpy = "0.20"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+num-traits = "0.2"
+half = "2.2"
+
+[build-dependencies]
+pyo3-build-config = "0.20"
