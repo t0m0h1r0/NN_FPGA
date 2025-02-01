@@ -13,6 +13,10 @@ pub struct FpgaAccelerator {
     memory_vector_size: usize,
     memory_matrix_size: usize,
     block_size: usize,
+    // 追加: 前処理済み行列用のフィールド
+    prepared_matrix: Option<Vec<Vec<FpgaMatrix>>>, // ブロック分割済みの行列
+    matrix_rows: usize,                           // 元の行列の行数
+    matrix_cols: usize,                           // 元の行列の列数
 }
 
 pub trait ComputeInput {
@@ -46,7 +50,53 @@ impl FpgaAccelerator {
             memory_vector_size: 64,
             memory_matrix_size: 256,
             block_size: 16,
+            prepared_matrix: None,
+            matrix_rows: 0,
+            matrix_cols: 0,
         }
+    }
+
+    /// 行列を準備し、内部に保持
+    pub fn prepare_matrix(
+        &mut self, 
+        matrix: &impl ComputeInput
+    ) -> Result<(), AcceleratorError> {
+        let matrix = matrix.as_matrix().ok_or_else(|| 
+            AcceleratorError::DataConversionError("Expected matrix input".to_string())
+        )?;
+
+        // 行列をブロックに分割
+        let matrix_blocks = matrix.split_into_blocks(self.block_size);
+        
+        // 行列の元のサイズを保存
+        self.matrix_rows = matrix.rows;
+        self.matrix_cols = matrix.cols;
+        
+        // 分割した行列を保持
+        self.prepared_matrix = Some(matrix_blocks);
+        
+        Ok(())
+    }
+
+    /// 準備済みの行列とベクトルの乗算を実行
+    pub fn compute_with_prepared_matrix(
+        &mut self,
+        vector: &impl ComputeInput
+    ) -> Result<FpgaVector, AcceleratorError> {
+        // 準備済み行列の確認
+        let matrix_blocks = self.prepared_matrix.as_ref().ok_or_else(|| 
+            AcceleratorError::DataConversionError("Matrix not prepared".to_string())
+        )?;
+
+        // ベクトルの次元チェック
+        let vector = vector.as_vector().ok_or_else(|| 
+            AcceleratorError::DataConversionError("Expected vector input".to_string())
+        )?;
+        if vector.dimension != self.matrix_cols {
+            return Err(AcceleratorError::InvalidDimension(vector.dimension));
+        }
+
+        self.compute_matrix_vector_multiply_internal(matrix_blocks, vector)
     }
 
     pub fn compute(
@@ -56,7 +106,20 @@ impl FpgaAccelerator {
     ) -> Result<FpgaVector, AcceleratorError> {
         match computation_type {
             ComputationType::MatrixVectorMultiply => {
-                self.matrix_vector_multiply(input)
+                if let Some(matrix) = input.as_matrix() {
+                    // 一時的な行列ベクトル乗算
+                    let matrix_blocks = matrix.split_into_blocks(self.block_size);
+                    // ダミーベクトルを作成（この部分は要修正）
+                    let dummy_vector = FpgaVector::from_numpy(
+                        &vec![0.0; matrix.cols],
+                        crate::core::data_types::VectorConversionType::Full
+                    )?;
+                    self.compute_matrix_vector_multiply_internal(&matrix_blocks, &dummy_vector)
+                } else {
+                    Err(AcceleratorError::DataConversionError(
+                        "Expected matrix input for matrix-vector multiplication".to_string()
+                    ))
+                }
             },
             _ => {
                 if let Some(vector) = input.as_vector() {
@@ -70,16 +133,12 @@ impl FpgaAccelerator {
         }
     }
 
-    fn matrix_vector_multiply(
-        &mut self, 
-        input: &impl ComputeInput
+    // 内部実装用のメソッド
+    fn compute_matrix_vector_multiply_internal(
+        &mut self,
+        matrix_blocks: &Vec<Vec<FpgaMatrix>>,
+        input_vector: &FpgaVector
     ) -> Result<FpgaVector, AcceleratorError> {
-        let matrix = input.as_matrix().ok_or_else(|| 
-            AcceleratorError::DataConversionError("Expected matrix input".to_string())
-        )?;
-
-        // 行列をブロックに分割
-        let matrix_blocks = matrix.split_into_blocks(self.block_size);
         let mut result_vector = Vec::new();
 
         for row_blocks in matrix_blocks {
@@ -87,19 +146,16 @@ impl FpgaAccelerator {
 
             for block in row_blocks {
                 let unit_id = self.select_unit()?;
-                
-                // 16x16ブロックごとに計算
-                let block_result = self.compute_matrix_block(&block, input)?;
+                let block_result = self.compute_matrix_block(block, input_vector)?;
                 
                 // 部分結果を累積
                 for (i, val) in block_result.data.iter().enumerate() {
-                    // 固定小数点数の加算を考慮
                     row_result[i] = match (row_result[i], val) {
                         (CompressedNum::Full(a), CompressedNum::Full(b)) => 
                             CompressedNum::Full(a + b),
                         (CompressedNum::FixedPoint1s31(a), CompressedNum::FixedPoint1s31(b)) => 
                             CompressedNum::FixedPoint1s31(a + b),
-                        _ => CompressedNum::Full(0.0), // エラーハンドリング用のデフォルト値
+                        _ => CompressedNum::Full(0.0),
                     };
                 }
 
@@ -109,25 +165,23 @@ impl FpgaAccelerator {
             result_vector.extend_from_slice(&row_result);
         }
 
-        FpgaVector::from_numpy(&result_vector.iter().map(|x| match x {
-            CompressedNum::Full(val) => *val,
-            CompressedNum::FixedPoint1s31(val) => 
-                CompressedNum::from_fixed_point_1s31(*val),
-            CompressedNum::Trinary(val) => 
-                CompressedNum::from_trinary(*val),
-        }).collect::<Vec<f32>>(), 
-        crate::core::data_types::VectorConversionType::Full)
+        FpgaVector::from_numpy(
+            &result_vector.iter().map(|x| match x {
+                CompressedNum::Full(val) => *val,
+                CompressedNum::FixedPoint1s31(val) => 
+                    CompressedNum::from_fixed_point_1s31(*val),
+                CompressedNum::Trinary(val) => 
+                    CompressedNum::from_trinary(*val),
+            }).collect::<Vec<f32>>(),
+            crate::core::data_types::VectorConversionType::Full
+        )
     }
 
     fn compute_matrix_block(
         &mut self, 
         matrix_block: &FpgaMatrix,
-        input: &impl ComputeInput
+        input_vector: &FpgaVector
     ) -> Result<FpgaVector, AcceleratorError> {
-        let input_vector = input.as_vector().ok_or_else(|| 
-            AcceleratorError::DataConversionError("Expected vector input".to_string())
-        )?;
-
         // 行列ブロックとベクトルの乗算
         let mut block_result = Vec::new();
         for row in &matrix_block.data {
@@ -138,14 +192,14 @@ impl FpgaAccelerator {
                         CompressedNum::Full(a_val * b_val),
                     (CompressedNum::FixedPoint1s31(a_val), CompressedNum::FixedPoint1s31(b_val)) => 
                         CompressedNum::FixedPoint1s31(a_val * b_val),
-                    _ => CompressedNum::Full(0.0), // エラーハンドリング
+                    _ => CompressedNum::Full(0.0),
                 })
                 .fold(CompressedNum::Full(0.0), |acc, x| match (acc, x) {
                     (CompressedNum::Full(a), CompressedNum::Full(b)) => 
                         CompressedNum::Full(a + b),
                     (CompressedNum::FixedPoint1s31(a), CompressedNum::FixedPoint1s31(b)) => 
                         CompressedNum::FixedPoint1s31(a + b),
-                    _ => CompressedNum::Full(0.0), // エラーハンドリング
+                    _ => CompressedNum::Full(0.0),
                 });
             block_result.push(dot_product);
         }

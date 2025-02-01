@@ -7,27 +7,51 @@ def main():
 
     # 64x128次元の行列と、128次元のベクトル
     matrix = np.random.randn(64, 128).astype(np.float32)
-    vector = np.random.randn(128).astype(np.float32)
+    vector1 = np.random.randn(128).astype(np.float32)
+    vector2 = np.random.randn(128).astype(np.float32)
 
     print("大規模行列ベクトル乗算のテスト:")
     print("行列サイズ:", matrix.shape)
-    print("ベクトルサイズ:", vector.shape)
+    print("ベクトルサイズ:", vector1.shape)
 
+    # 行列の準備
+    print("\n行列を準備中...")
+    accelerator.prepare_matrix(matrix)
+    print("行列の準備完了")
+
+    # 1つ目のベクトルとの乗算
+    print("\n1つ目のベクトルとの乗算:")
     # NumPy計算（比較用）
-    numpy_result = np.dot(matrix, vector)
-    print("\nNumPy計算結果の最初の5要素:", numpy_result[:5])
+    numpy_result1 = np.dot(matrix, vector1)
+    print("NumPy計算結果の最初の5要素:", numpy_result1[:5])
 
     # FPGAアクセラレータによる計算
-    fpga_result = accelerator.compute_matrix_vector_multiply(matrix, vector)
-    print("FPGAアクセラレータ計算結果の最初の5要素:", fpga_result[:5])
+    fpga_result1 = accelerator.compute_with_prepared_matrix(vector1)
+    print("FPGAアクセラレータ計算結果の最初の5要素:", fpga_result1[:5])
+
+    # 2つ目のベクトルとの乗算
+    print("\n2つ目のベクトルとの乗算:")
+    # NumPy計算（比較用）
+    numpy_result2 = np.dot(matrix, vector2)
+    print("NumPy計算結果の最初の5要素:", numpy_result2[:5])
+
+    # FPGAアクセラレータによる計算
+    fpga_result2 = accelerator.compute_with_prepared_matrix(vector2)
+    print("FPGAアクセラレータ計算結果の最初の5要素:", fpga_result2[:5])
 
     # 結果の比較
     try:
         np.testing.assert_almost_equal(
-            fpga_result, 
-            numpy_result, 
+            fpga_result1, 
+            numpy_result1, 
             decimal=3, 
-            err_msg="FPGAアクセラレータの計算結果がNumPyと大きく異なります"
+            err_msg="1つ目のベクトル: FPGAアクセラレータの計算結果がNumPyと大きく異なります"
+        )
+        np.testing.assert_almost_equal(
+            fpga_result2, 
+            numpy_result2, 
+            decimal=3, 
+            err_msg="2つ目のベクトル: FPGAアクセラレータの計算結果がNumPyと大きく異なります"
         )
         print("\n計算結果の検証に成功しました。")
     except AssertionError as e:

@@ -22,4 +22,13 @@ pub enum AcceleratorError {
 
     #[error("Internal FPGA communication error: {0}")]
     CommunicationError(String),
+
+    #[error("Matrix not prepared: {0}")]
+    MatrixNotPrepared(String),
+
+    #[error("Matrix dimension mismatch: expected {expected}, got {got}")]
+    MatrixDimensionMismatch {
+        expected: usize,
+        got: usize,
+    },
 }

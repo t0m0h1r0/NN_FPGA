@@ -31,6 +31,45 @@ impl PyFpgaAccelerator {
         }
     }
 
+    /// 行列を準備
+    fn prepare_matrix(
+        &mut self,
+        py: Python,
+        matrix: &PyArray2<f32>
+    ) -> PyResult<()> {
+        let matrix_data: Array2<f32> = matrix.readonly().as_array().to_owned();
+        
+        let fpga_matrix = FpgaMatrix::from_numpy(
+            &matrix_data
+                .rows()
+                .into_iter()
+                .map(|row| row.to_vec())
+                .collect()
+        ).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        self.inner.prepare_matrix(&fpga_matrix)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// 準備済み行列とベクトルの乗算
+    fn compute_with_prepared_matrix(
+        &mut self,
+        py: Python,
+        vector: &PyArray1<f32>
+    ) -> PyResult<Py<PyArray1<f32>>> {
+        let vector_data: Vec<f32> = vector.readonly().as_slice()?.to_vec();
+        
+        let fpga_vector = FpgaVector::from_numpy(
+            &vector_data,
+            VectorConversionType::Full
+        ).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        let result = self.inner.compute_with_prepared_matrix(&fpga_vector)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        Ok(result.to_numpy().to_pyarray(py).to_owned())
+    }
+
     fn compute_vector(&mut self, py: Python, input: &PyArray1<f32>, comp_type: &str) -> PyResult<Py<PyArray1<f32>>> {
         let input_vec: Vec<f32> = input.readonly().as_slice()?.to_vec();
         
