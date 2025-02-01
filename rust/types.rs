@@ -1,18 +1,33 @@
 // types.rs
 
-/// ブロックのサイズ（16x16）
-pub const BLOCK_SIZE: usize = 16;
+#[derive(Debug, Clone, Copy)]
+pub enum Operation {
+    Nop,
+    Load,
+    Store,
+    Compute,
+    Copy,    // 追加：ベクトルコピー操作
+    AddVec,  // 追加：ベクトル加算操作
+}
 
-/// アクティベーション関数の種類
 #[derive(Debug, Clone, Copy)]
 pub enum Activation {
-    /// 双曲線正接関数
     Tanh,
-    /// 正規化線形関数
     ReLU,
 }
 
-/// ブロックのインデックス
+// ブロックサイズは16x16のまま
+pub const BLOCK_SIZE: usize = 16;
+pub const UNIT_COUNT: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+pub struct UnitConfig {
+    pub target_unit: usize,   // ターゲットユニットID
+    pub source_unit: usize,   // 追加：ソースユニットID
+    pub operation: Operation,
+    pub activation: Option<Activation>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct BlockIndex {
     pub row: usize,
@@ -25,7 +40,6 @@ impl BlockIndex {
     }
 }
 
-/// 行と列のインデックス
 #[derive(Debug, Clone, Copy)]
 pub struct MatrixIndex {
     pub row: usize,
@@ -37,7 +51,6 @@ impl MatrixIndex {
         Self { row, col }
     }
 
-    /// ブロックインデックスとブロック内インデックスに分解
     pub fn to_block_indices(&self) -> (BlockIndex, MatrixIndex) {
         let block = BlockIndex::new(
             self.row / BLOCK_SIZE,
