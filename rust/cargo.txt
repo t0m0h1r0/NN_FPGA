@@ -1,0 +1,17 @@
+[package]
+name = "nn_accel"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nn_accel"
+crate-type = ["cdylib"]
+
+[dependencies]
+rayon = "1.8"
+numpy = "0.20"
+pyo3 = { version = "0.20", features = ["extension-module", "numpy"] }
+
+[features]
+extension-module = ["pyo3/extension-module"]
+default = ["extension-module"]
