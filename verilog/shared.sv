@@ -6,17 +6,15 @@ module shared_compute_unit
     input  logic rst_n,
     
     // 制御インターフェース
-    input  logic [1:0] unit_id,         // 要求元ユニットのID
-    input  logic request,               // 演算要求
-    output logic ready,                 // 演算器使用可能
-    output logic done,                  // 演算完了
+    input  logic [1:0] unit_id,
+    input  logic request,
+    output logic ready,
+    output logic done,
     
     // データインターフェース
     input  comp_type_e comp_type,
-    input  vector_t vector_a,
-    input  vector_t vector_b,
-    input  matrix_t matrix_in,
-    output vector_t result
+    input  data_t data_in,
+    output data_t result
 );
     // 計算ステージ
     typedef enum logic [1:0] {
@@ -76,42 +74,47 @@ module shared_compute_unit
 
         // カウンタ更新と状態遷移
         compute_counter <= compute_counter + 1;
-        if (compute_counter == VECTOR_DEPTH - 1) begin
+        if (compute_counter == DATA_DEPTH - 1) begin
             current_state <= ST_COMPLETE;
         end
     endtask
 
     // 加算計算
     task compute_addition();
-        result.data[compute_counter] = 
-            vector_a.data[compute_counter] + vector_b.data[compute_counter];
+        for (int i = 0; i < DATA_DEPTH; i++) begin
+            result.vector.data[i] = data_in.vector.data[i] + data_in.matrix.data[i][0];
+        end
     endtask
 
     // 行列乗算
     task compute_matrix_multiplication();
-        logic [VECTOR_WIDTH-1:0] sum = '0;
-        for (int j = 0; j < MATRIX_DEPTH; j++) begin
-            if (matrix_in.data[compute_counter][j][0]) begin
-                sum += matrix_in.data[compute_counter][j][1] ? 
-                    -vector_a.data[j] : vector_a.data[j];
+        for (int i = 0; i < DATA_DEPTH; i++) begin
+            logic [VECTOR_WIDTH-1:0] sum = '0;
+            for (int j = 0; j < DATA_DEPTH; j++) begin
+                if (data_in.matrix.data[i][j][0]) begin
+                    sum += data_in.matrix.data[i][j][1] ?
+                        -data_in.vector.data[j] : data_in.vector.data[j];
+                end
             end
+            result.vector.data[i] = sum;
         end
-        result.data[compute_counter] = sum;
     endtask
 
     // Tanh活性化
     task compute_tanh_activation();
-        result.data[compute_counter] = 
-            vector_a.data[compute_counter][VECTOR_WIDTH-1] ? 
-            {1'b1, {(VECTOR_WIDTH-1){1'b0}}} :
-            {1'b0, {(VECTOR_WIDTH-1){1'b1}}};
+        for (int i = 0; i < DATA_DEPTH; i++) begin
+            result.vector.data[i] = data_in.vector.data[i][VECTOR_WIDTH-1] ?
+                {1'b1, {(VECTOR_WIDTH-1){1'b0}}} :
+                {1'b0, {(VECTOR_WIDTH-1){1'b1}}};
+        end
     endtask
 
     // ReLU活性化
     task compute_relu_activation();
-        result.data[compute_counter] = 
-            vector_a.data[compute_counter][VECTOR_WIDTH-1] ? 
-            '0 : vector_a.data[compute_counter];
+        for (int i = 0; i < DATA_DEPTH; i++) begin
+            result.vector.data[i] = data_in.vector.data[i][VECTOR_WIDTH-1] ?
+                '0 : data_in.vector.data[i];
+        end
     endtask
 
     // 完了状態ハンドリング
@@ -121,13 +124,4 @@ module shared_compute_unit
         current_state <= ST_IDLE;
     endtask
 
-    // デバッグ用モニタリング
-    // synthesis translate_off
-    always @(posedge clk) begin
-        if (current_state == ST_COMPUTE) begin
-            $display("共有計算ユニット: unit_id=%0d, comp_type=%0d, counter=%0d", 
-                     current_unit, comp_type, compute_counter);
-        end
-    end
-    // synthesis translate_on
 endmodule

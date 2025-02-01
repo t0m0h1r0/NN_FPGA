@@ -23,9 +23,8 @@ module processing_unit
     input  logic mem_done,
     
     // データインターフェース
-    input  vector_t data_in,
-    input  matrix_t matrix_in,
-    output vector_t data_out
+    input  data_t data_in,
+    output data_t data_out
 );
     // 内部状態
     typedef enum logic [1:0] {
@@ -35,7 +34,7 @@ module processing_unit
         ST_WRITEBACK
     } unit_state_e;
 
-    // デコーダ
+    // デコーダ 
     decoded_ctrl_t decoded_ctrl;
     logic decode_valid;
     logic [1:0] error_status;
@@ -52,7 +51,6 @@ module processing_unit
     // 内部状態レジスタ
     unit_state_e current_state;
     vector_t temp_vector;
-    matrix_t temp_matrix;
 
     // メインステートマシン
     always_ff @(posedge clk or negedge rst_n) begin
@@ -110,12 +108,10 @@ module processing_unit
                 mem_request <= 1'b1;
                 mem_op_type <= 4'b0010;
                 vec_index <= decoded_ctrl.addr;
-                write_data <= data_in;
+                write_data <= data_out.vector;
             end
             OP_COMPUTE: begin
-                mem_request <= 1'b1;
-                mem_op_type <= 4'b0100;
-                temp_matrix <= matrix_in;
+                current_state <= ST_EXECUTE;
             end
             default: reset_unit();
         endcase
@@ -124,37 +120,36 @@ module processing_unit
 
     // 実行状態ハンドリング
     task handle_execute_state();
-        if (mem_done) begin
-            case (decoded_ctrl.op_code)
-                OP_LOAD: begin
+        case (decoded_ctrl.op_code)
+            OP_LOAD: begin
+                if (mem_done) begin
                     temp_vector <= read_data;
                     current_state <= ST_WRITEBACK;
+                    mem_request <= 1'b0;
                 end
-                OP_STORE: begin
+            end
+            OP_STORE: begin
+                if (mem_done) begin
                     current_state <= ST_WRITEBACK;
+                    mem_request <= 1'b0;
                 end
-                OP_COMPUTE: begin
-                    temp_vector <= read_data;
-                    current_state <= ST_WRITEBACK;
-                end
-                default: reset_unit();
-            endcase
-            mem_request <= 1'b0;
-        end
+            end
+            OP_COMPUTE: begin
+                data_out <= compute_result();
+                current_state <= ST_WRITEBACK;
+            end
+            default: reset_unit();
+        endcase
     endtask
-
+    
     // ライトバック状態ハンドリング
     task handle_writeback_state();
         case (decoded_ctrl.op_code)
             OP_LOAD: begin
-                data_out <= temp_vector;
+                data_out.vector <= temp_vector;
                 done <= 1'b1;
             end
-            OP_COMPUTE: begin
-                data_out <= compute_result(decoded_ctrl.comp_type);
-                done <= 1'b1;
-            end
-            OP_STORE: begin
+            OP_COMPUTE, OP_STORE: begin
                 done <= 1'b1;
             end
         endcase
@@ -164,53 +159,44 @@ module processing_unit
     endtask
 
     // 計算結果生成関数
-    function vector_t compute_result(input comp_type_e comp_type);
-        vector_t result;
+    function data_t compute_result();
+        data_t result;
         
-        case (comp_type)
+        case (decoded_ctrl.comp_type)
             COMP_ADD: begin
-                for (int i = 0; i < VECTOR_DEPTH; i++) begin
-                    result.data[i] = temp_vector.data[i] + read_data.data[i];
+                for (int i = 0; i < DATA_DEPTH; i++) begin
+                    result.vector.data[i] = data_in.vector.data[i] + data_in.matrix.data[i][0];
                 end
             end
             COMP_MUL: begin
-                for (int i = 0; i < VECTOR_DEPTH; i++) begin
+                for (int i = 0; i < DATA_DEPTH; i++) begin
                     logic [VECTOR_WIDTH-1:0] sum = '0;
-                    for (int j = 0; j < MATRIX_DEPTH; j++) begin
-                        if (temp_matrix.data[i][j][0]) begin
-                            sum += temp_matrix.data[i][j][1] ? 
-                                -temp_vector.data[j] : temp_vector.data[j];
+                    for (int j = 0; j < DATA_DEPTH; j++) begin
+                        if (data_in.matrix.data[i][j][0]) begin
+                            sum += data_in.matrix.data[i][j][1] ?
+                                -data_out.vector.data[j] : data_out.vector.data[j];
                         end
                     end
-                    result.data[i] = sum;
+                    result.vector.data[i] = sum;
                 end
             end
             COMP_TANH: begin
-                for (int i = 0; i < VECTOR_DEPTH; i++) begin
-                    result.data[i] = temp_vector.data[i][VECTOR_WIDTH-1] ? 
+                for (int i = 0; i < DATA_DEPTH; i++) begin
+                    result.vector.data[i] = data_out.vector.data[i][VECTOR_WIDTH-1] ?
                         {1'b1, {(VECTOR_WIDTH-1){1'b0}}} :
                         {1'b0, {(VECTOR_WIDTH-1){1'b1}}};
                 end
             end
             COMP_RELU: begin
-                for (int i = 0; i < VECTOR_DEPTH; i++) begin
-                    result.data[i] = temp_vector.data[i][VECTOR_WIDTH-1] ? 
-                        '0 : temp_vector.data[i];
+                for (int i = 0; i < DATA_DEPTH; i++) begin
+                    result.vector.data[i] = data_out.vector.data[i][VECTOR_WIDTH-1] ?
+                        '0 : data_out.vector.data[i];
                 end
             end
-            default: result = temp_vector;
+            default: result = data_out;
         endcase
         
         return result;
     endfunction
 
-    // デバッグ用モニタリング
-    // synthesis translate_off
-    always @(posedge clk) begin
-        if (current_state != ST_IDLE) begin
-            $display("Unit %0d: state=%0d, op_code=%0d", 
-                    unit_id, current_state, decoded_ctrl.op_code);
-        end
-    end
-    // synthesis translate_on
 endmodule

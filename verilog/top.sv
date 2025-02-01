@@ -10,8 +10,8 @@ module accelerator_top
     output logic [15:0] perf_counter,
 
     // データインターフェース
-    input  matrix_t data_in [UNIT_COUNT],  // 入力データとマトリックスを統合
-    output vector_t data_out [UNIT_COUNT]
+    input  data_t data_in [UNIT_COUNT],
+    output data_t data_out [UNIT_COUNT]
 );
     // 内部接続信号
     ctrl_packet_t [UNIT_COUNT-1:0] unit_control;
@@ -23,15 +23,15 @@ module accelerator_top
     logic compute_ready;
     logic compute_done;
     comp_type_e current_comp_type;
-    matrix_t current_data;
-    vector_t compute_result;
+    data_t current_data;
+    data_t compute_result;
 
     // システムコントローラ
     system_controller u_system_controller (
         .clk(clk),
         .rst_n(rst_n),
         .sys_control(sys_control),
-        .sys_status(sys_status),
+        .sys_status(sys_status), 
         .unit_control(unit_control),
         .unit_ready(unit_ready),
         .unit_done(unit_done),
@@ -42,7 +42,7 @@ module accelerator_top
     shared_compute_unit u_shared_compute (
         .clk(clk),
         .rst_n(rst_n),
-        .unit_id('0),  // 8ビットのユニットID
+        .unit_id('0),
         .request(unit_compute_request[0]),
         .ready(compute_ready),
         .done(compute_done),

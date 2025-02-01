@@ -187,15 +187,4 @@ module system_controller
         };
     endtask
 
-    // デバッグ用モニタリング
-    // synthesis translate_off
-    always @(posedge clk) begin
-        if (current_state == ST_EXECUTE) begin
-            $display("システム状態:");
-            $display("アクティブユニット: %b", active_units);
-            $display("ユニット優先度: %b", unit_priority);
-            $display("パフォーマンスカウンタ: %0d", cycle_counter);
-        end
-    end
-    // synthesis translate_on
 endmodule
