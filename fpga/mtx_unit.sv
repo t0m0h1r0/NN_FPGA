@@ -22,65 +22,66 @@ module mtx_unit(
     import mtx_types::*;
 
     // レジスタ
-    mv_t V0, V1, M0;
-    status_t status;
+    vec_t V0, V1;     // ベクトルレジスタ
+    mtx_t M0;         // 行列レジスタ
+    status_t status;  // 状態レジスタ
 
     // ReLU計算関数
-    function automatic mv_t relu_activation(input mv_t input_vec);
-        mv_t result = input_vec;
+    function automatic vec_t relu_activation(input vec_t input_vec);
+        vec_t result;
         for (int i = 0; i < V; i++) begin
-            result.vec.vec[i] = (input_vec.vec.vec[i] > 0) ? 
-                input_vec.vec.vec[i] : '0;
+            result.elements[i] = (input_vec.elements[i] > 0) ? 
+                input_vec.elements[i] : '0;
         end
         return result;
     endfunction
 
     // Hard Tanh計算関数
-    function automatic mv_t hard_tanh_activation(input mv_t input_vec);
-        mv_t result = input_vec;
+    function automatic vec_t hard_tanh_activation(input vec_t input_vec);
+        vec_t result;
         logic signed [31:0] min_val = -32'sh1;  // -1
         logic signed [31:0] max_val = 32'sh1;   // +1
         
         for (int i = 0; i < V; i++) begin
-            if (input_vec.vec.vec[i] < min_val)
-                result.vec.vec[i] = min_val;
-            else if (input_vec.vec.vec[i] > max_val)
-                result.vec.vec[i] = max_val;
+            if (input_vec.elements[i] < min_val)
+                result.elements[i] = min_val;
+            else if (input_vec.elements[i] > max_val)
+                result.elements[i] = max_val;
             else
-                result.vec.vec[i] = input_vec.vec.vec[i];
+                result.elements[i] = input_vec.elements[i];
         end
         return result;
     endfunction
 
     // ベクトル二乗計算関数
-    function automatic mv_t vector_square(input mv_t input_vec);
-        mv_t result;
+    function automatic vec_t vector_square(input vec_t input_vec);
+        vec_t result;
         for (int i = 0; i < V; i++) begin
             // 二乗計算と飽和
             logic signed [63:0] squared = 
-                $signed(input_vec.vec.vec[i]) * $signed(input_vec.vec.vec[i]);
-            result.vec.vec[i] = sat(squared);
+                $signed(input_vec.elements[i]) * $signed(input_vec.elements[i]);
+            result.elements[i] = sat(squared);
         end
         return result;
     endfunction
 
     // 行列-ベクトル乗算の内部関数
-    function automatic mv_t matrix_vector_mul(
-        input mv_t matrix,
-        input mv_t vector
+    function automatic vec_t matrix_vector_mul(
+        input mtx_t matrix,
+        input vec_t vector
     );
-        mv_t result;
+        vec_t result;
         
         for (int r = 0; r < R; r++) begin
             logic signed [63:0] sum = '0;
             
             for (int c = 0; c < C; c++) begin
-                val3_t val = matrix.mtx.data3[r][c];
-                q31_t mult = mul3(val, vector.vec.vec[c]);
+                val3_t val = matrix.elements[r][c];
+                q31_t mult = mul3(val, vector.elements[c]);
                 sum += mult;
             end
             
-            result.vec.vec[r] = sat(sum);
+            result.elements[r] = sat(sum);
         end
         
         return result;
@@ -119,14 +120,14 @@ module mtx_unit(
                     end
 
                     // ロード命令
-                    LD_V0: V0 <= in;
-                    LD_V1: V1 <= in;
-                    LD_M0: M0 <= in;
+                    LD_V0: V0 <= in.vec;
+                    LD_V1: V1 <= in.vec;
+                    LD_M0: M0 <= in.mtx;
 
                     // ストア命令
-                    ST_V0: out <= V0;
-                    ST_V1: out <= V1;
-                    ST_M0: out <= M0;
+                    ST_V0: out.vec <= V0;
+                    ST_V1: out.vec <= V1;
+                    ST_M0: out.mtx <= M0;
 
                     // ゼロ初期化
                     ZERO_V0: V0 <= '0;
@@ -134,55 +135,55 @@ module mtx_unit(
                     ZERO_M0: M0 <= '0;
 
                     // メモリ関連命令
-                    PUSH_V0: global_shared_mem_out <= V0;
-                    PULL_V1: V1 <= global_shared_mem_in;
-                    PULL_V0: V0 <= global_shared_mem_in;
+                    PUSH_V0: global_shared_mem_out.vec <= V0;
+                    PULL_V1: V1 <= global_shared_mem_in.vec;
+                    PULL_V0: V0 <= global_shared_mem_in.vec;
 
                     // 行列-ベクトル乗算
                     MVMUL: begin
                         V0 <= matrix_vector_mul(M0, V0);
-                        status.zero <= (V0.vec.vec == '0);
+                        status.zero <= (V0.elements == '0);
                     end
 
                     // ベクトル演算
                     VADD_01: begin
                         for (int j = 0; j < V; j++) begin
                             logic signed [33:0] sum = 
-                                $signed({1'b0, V0.vec.vec[j]}) + 
-                                $signed({1'b0, V1.vec.vec[j]});
+                                $signed({1'b0, V0.elements[j]}) + 
+                                $signed({1'b0, V1.elements[j]});
                             
-                            V0.vec.vec[j] <= sat(sum);
+                            V0.elements[j] <= sat(sum);
                             status.of |= (sum > 34'sh7FFFFFFF || sum < -34'sh7FFFFFFF);
                         end
-                        status.zero <= (V0.vec.vec == '0);
+                        status.zero <= (V0.elements == '0);
                     end
 
                     VSUB_01: begin
                         for (int j = 0; j < V; j++) begin
                             logic signed [33:0] diff = 
-                                $signed({1'b0, V0.vec.vec[j]}) - 
-                                $signed({1'b0, V1.vec.vec[j]});
+                                $signed({1'b0, V0.elements[j]}) - 
+                                $signed({1'b0, V1.elements[j]});
                             
-                            V0.vec.vec[j] <= sat(diff);
+                            V0.elements[j] <= sat(diff);
                             status.of |= (diff > 34'sh7FFFFFFF || diff < -34'sh7FFFFFFF);
                         end
-                        status.zero <= (V0.vec.vec == '0);
+                        status.zero <= (V0.elements == '0);
                     end
 
                     // 活性化関数
                     VRELU: begin
                         V0 <= relu_activation(V0);
-                        status.zero <= (V0.vec.vec == '0);
+                        status.zero <= (V0.elements == '0);
                     end
 
                     VHTANH: begin
                         V0 <= hard_tanh_activation(V0);
-                        status.zero <= (V0.vec.vec == '0);
+                        status.zero <= (V0.elements == '0);
                     end
 
                     VSQR: begin
                         V0 <= vector_square(V0);
-                        status.zero <= (V0.vec.vec == '0);
+                        status.zero <= (V0.elements == '0);
                     end
 
                     default: begin

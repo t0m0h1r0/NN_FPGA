@@ -18,6 +18,23 @@ package mtx_types;
     // 固定小数点型
     typedef logic signed [31:0] q31_t;
 
+    // ベクトル型（V個のq31_t）
+    typedef struct packed {
+        q31_t [V-1:0] elements;
+    } vec_t;
+
+    // 行列型（R×Cの三値行列）
+    typedef struct packed {
+        val3_t [R-1:0][C-1:0] elements;
+    } mtx_t;
+
+    // データ共用型（ベクトルまたは行列として解釈可能）
+    typedef union packed {
+        mtx_t mtx;
+        vec_t vec;
+        logic [511:0] raw;  // 512ビット = 16×16×2ビット（三値）
+    } mv_t;
+
     // 命令型
     typedef enum logic [4:0] {
         NOP        = 5'b00000,  // 何もしない命令
@@ -44,8 +61,8 @@ package mtx_types;
 
         // メモリ関連命令
         PUSH_V0   = 5'b10001,  // V0を共有メモリにコピー
-        PULL_V1    = 5'b10010,  // 共有メモリからV1にコピー
-        PULL_V0    = 5'b10011,  // 共有メモリからV0にコピー
+        PULL_V1   = 5'b10010,  // 共有メモリからV1にコピー
+        PULL_V0   = 5'b10011,  // 共有メモリからV0にコピー
 
         // 活性化関数
         VRELU     = 5'b10100,  // V0にReLU適用
@@ -60,19 +77,6 @@ package mtx_types;
         op_t op3;
         op_t op4;
     } vliw_inst_t;
-
-    // 行列/ベクトル共用体型
-    typedef union packed {
-        struct packed {
-            val3_t [R-1:0][C-1:0] data3;
-        } mtx;
-        
-        struct packed {
-            q31_t [V-1:0] vec;
-        } vec;
-        
-        logic [511:0] raw;
-    } mv_t;
 
     // 演算状態
     typedef struct packed {
