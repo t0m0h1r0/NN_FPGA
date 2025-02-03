@@ -45,11 +45,12 @@ package mtx_types;
         // メモリ関連命令
         PUSH_V0   = 5'b10001,  // V0を共有メモリにコピー
         POP_V1    = 5'b10010,  // 共有メモリからV1にコピー
+        POP_V0    = 5'b10011,  // 共有メモリからV0にコピー 【新規追加】
 
         // 活性化関数
-        VRELU     = 5'b10011,  // V0にReLU適用
-        VHTANH    = 5'b10100,  // V0にHard Tanh適用
-        VSQR      = 5'b10101   // V0 = V0^2
+        VRELU     = 5'b10100,  // V0にReLU適用
+        VHTANH    = 5'b10101,  // V0にHard Tanh適用
+        VSQR      = 5'b10110   // V0 = V0^2
     } op_t;
 
     // VLIW命令構造体（4段）

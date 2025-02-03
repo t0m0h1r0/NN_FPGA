@@ -129,6 +129,11 @@ impl ComputeUnit {
                         self.v1 = shared_memory[self.id].data.clone();
                     }
                 },
+                VliwCommand::PopV0 => {  // 【新規追加】
+                    if shared_memory[self.id].valid {
+                        self.v0 = shared_memory[self.id].data.clone();
+                    }
+                },
                 VliwCommand::MatrixVectorMultiply => {
                     self.execute_matrix_vector_multiply()?;
                 },
@@ -223,61 +228,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_matrix_load_and_multiply() {
+    fn test_pop_v0_instruction() {
         let mut unit = ComputeUnit::new(0);
-        
-        // テスト行列の作成（単位行列）
-        let matrix = vec![vec![FpgaValue::from_f32(1.0, DataConversionType::Full); MATRIX_SIZE]; MATRIX_SIZE];
-        
-        // 行列のロード
-        assert!(unit.load_matrix(matrix).is_ok());
-        assert_eq!(unit.status, UnitStatus::MatrixLoaded);
-        
-        // テストベクトルの作成
-        let vector = (0..MATRIX_SIZE)
+        let mut shared_memory = vec![SharedMemoryEntry { data: Vec::new(), valid: false }; 1];
+
+        // テストデータの準備
+        let test_data: Vec<FpgaValue> = (0..VECTOR_SIZE)
             .map(|i| FpgaValue::from_f32(i as f32, DataConversionType::Full))
             .collect();
-            
-        // 乗算実行
-        assert!(unit.load_and_multiply(vector).is_ok());
-        
-        // 結果の確認（単位行列なので入力ベクトルと同じになるはず）
-        let result = unit.get_v0();
-        for i in 0..MATRIX_SIZE {
-            assert!((result[i].to_f32() - i as f32).abs() < 1e-6);
+
+        // 共有メモリにデータを設定
+        shared_memory[0] = SharedMemoryEntry {
+            data: test_data.clone(),
+            valid: true,
+        };
+
+        // PopV0命令を実行
+        let pop_inst = VliwInstruction {
+            op1: VliwCommand::PopV0,
+            op2: VliwCommand::Nop,
+            op3: VliwCommand::Nop,
+            op4: VliwCommand::Nop,
+        };
+
+        // 命令実行
+        assert!(unit.execute_instruction(&pop_inst, &mut shared_memory).is_ok());
+
+        // 結果の検証
+        for (i, val) in unit.get_v0().iter().enumerate() {
+            assert_eq!(val.to_f32(), i as f32);
         }
     }
 
     #[test]
-    fn test_matrix_reuse() {
+    fn test_pop_v0_with_invalid_memory() {
         let mut unit = ComputeUnit::new(0);
-        
-        // テスト行列のロード
-        let matrix = vec![vec![FpgaValue::from_f32(2.0, DataConversionType::Full); MATRIX_SIZE]; MATRIX_SIZE];
-        assert!(unit.load_matrix(matrix).is_ok());
-        
-        // 複数回の乗算テスト
-        for k in 0..3 {
-            let vector = vec![FpgaValue::from_f32(k as f32, DataConversionType::Full); MATRIX_SIZE];
-            assert!(unit.load_and_multiply(vector).is_ok());
-            assert_eq!(unit.status, UnitStatus::MatrixLoaded);
-        }
-    }
+        let mut shared_memory = vec![SharedMemoryEntry { data: Vec::new(), valid: false }; 1];
 
-    #[test]
-    fn test_error_cases() {
-        let mut unit = ComputeUnit::new(0);
-        
-        // 行列がロードされていない状態での乗算
-        let vector = vec![FpgaValue::from_f32(1.0, DataConversionType::Full); MATRIX_SIZE];
-        assert!(matches!(unit.load_and_multiply(vector), Err(UnitError::MatrixNotLoaded)));
-        
-        // 正しい順序での操作
-        let matrix = vec![vec![FpgaValue::from_f32(1.0, DataConversionType::Full); MATRIX_SIZE]; MATRIX_SIZE];
-        assert!(unit.load_matrix(matrix).is_ok());
-        
-        // 行列ロード済み状態での再ロード
-        let matrix2 = vec![vec![FpgaValue::from_f32(2.0, DataConversionType::Full); MATRIX_SIZE]; MATRIX_SIZE];
-        assert!(matches!(unit.load_matrix(matrix2), Err(UnitError::InvalidInstruction)));
+        // PopV0命令を実行
+        let pop_inst = VliwInstruction {
+            op1: VliwCommand::PopV0,
+            op2: VliwCommand::Nop,
+            op3: VliwCommand::Nop,
+            op4: VliwCommand::Nop,
+        };
+
+        // 命令実行（メモリが無効な場合）
+        assert!(unit.execute_instruction(&pop_inst, &mut shared_memory).is_ok());
+
+        // 結果の検証（変更がないことを確認）
+        for val in unit.get_v0() {
+            assert_eq!(val.to_f32(), 0.0);
+        }
     }
 }

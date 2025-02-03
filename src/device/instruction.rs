@@ -15,6 +15,7 @@ pub enum VliwCommand {
     ZeroM0,
     PushV0,
     PopV1,
+    PopV0, // 【新規追加】
     MatrixVectorMultiply,
     VectorAdd01,
     VectorSub01,
@@ -112,6 +113,16 @@ mod tests {
     fn test_single_instruction() {
         let inst = VliwInstruction::single(VliwCommand::MatrixVectorMultiply);
         assert!(matches!(inst.op1, VliwCommand::MatrixVectorMultiply));
+        assert!(matches!(inst.op2, VliwCommand::Nop));
+        assert!(matches!(inst.op3, VliwCommand::Nop));
+        assert!(matches!(inst.op4, VliwCommand::Nop));
+    }
+
+    // PopV0のテストを追加
+    #[test]
+    fn test_pop_v0_instruction() {
+        let inst = VliwInstruction::single(VliwCommand::PopV0);
+        assert!(matches!(inst.op1, VliwCommand::PopV0));
         assert!(matches!(inst.op2, VliwCommand::Nop));
         assert!(matches!(inst.op3, VliwCommand::Nop));
         assert!(matches!(inst.op4, VliwCommand::Nop));

@@ -136,6 +136,7 @@ module mtx_unit(
                     // メモリ関連命令
                     PUSH_V0: global_shared_mem_out <= V0;
                     POP_V1: V1 <= global_shared_mem_in;
+                    POP_V0: V0 <= global_shared_mem_in; // 【新規追加】
 
                     // 行列-ベクトル乗算
                     MVMUL: begin
