@@ -1,6 +1,6 @@
-mod types;
-mod math;
-mod device;
+pub mod types;
+pub mod math;
+pub mod device;
 
 use pyo3::prelude::*;
 use numpy::{PyArray1, PyArray2, ToPyArray};
@@ -207,3 +207,4 @@ impl PyFpgaAccelerator {
 fn fpga_accelerator(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyFpgaAccelerator>()?;
     Ok(())
+}
