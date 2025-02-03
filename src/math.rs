@@ -1,195 +1,169 @@
-use crate::types::{
-    DataConversionType, FpgaValue, MATRIX_SIZE, VECTOR_SIZE,
-    TypeConversionError, ComputationType,
-};
-use thiserror::Error;
+use crate::types::{FpgaError, Result, FpgaValue, MATRIX_SIZE, VECTOR_SIZE, DataConverter};
+use std::ops::{Add, Mul};
 
-#[derive(Error, Debug)]
-pub enum MathError {
-    #[error("無効なベクトルサイズ: {size}, 16の倍数である必要があります")]
-    InvalidVectorSize { size: usize },
-    
-    #[error("無効な行列サイズ: {rows}x{cols}, 各次元は16の倍数である必要があります")]
-    InvalidMatrixSize { rows: usize, cols: usize },
-    
-    #[error("次元の不一致: 行列 {matrix_size}x{matrix_cols}, ベクトル {vector_size}")]
-    DimensionMismatch {
-        matrix_size: usize,
-        matrix_cols: usize,
-        vector_size: usize,
-    },
-    
-    #[error("データ型変換エラー: {0}")]
-    TypeConversion(#[from] TypeConversionError),
-}
-
-/// FPGAベクトル
 #[derive(Debug, Clone)]
-pub struct FpgaVector {
-    data: Vec<FpgaValue>,
-    conversion_type: DataConversionType,
-}
-
-/// FPGA行列
-#[derive(Debug, Clone)]
-pub struct FpgaMatrix {
+pub struct Matrix {
     data: Vec<Vec<FpgaValue>>,
     rows: usize,
     cols: usize,
-    conversion_type: DataConversionType,
 }
 
-impl FpgaVector {
-    /// NumPy配列からFPGAベクトルを生成
-    pub fn from_numpy(values: &[f32], conversion_type: DataConversionType) -> Result<Self, MathError> {
-        if values.len() % VECTOR_SIZE != 0 {
-            return Err(MathError::InvalidVectorSize { size: values.len() });
+impl Matrix {
+    pub fn new(data: Vec<Vec<FpgaValue>>) -> Result<Self> {
+        if data.is_empty() {
+            return Err(FpgaError::Computation("Empty matrix".into()));
+        }
+        let rows = data.len();
+        let cols = data[0].len();
+        if data.iter().any(|row| row.len() != cols) {
+            return Err(FpgaError::Computation("Irregular matrix shape".into()));
+        }
+        
+        Ok(Self { data, rows, cols })
+    }
+
+    pub fn from_f32(data: &[Vec<f32>], converter: &DataConverter) -> Result<Self> {
+        let converted = data.iter()
+            .map(|row| row.iter()
+                .map(|&x| converter.convert(x))
+                .collect::<Result<Vec<_>>>())
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(converted)
+    }
+
+    pub fn multiply_vector(&self, vector: &Vector) -> Result<Vector> {
+        if self.cols != vector.len() {
+            return Err(FpgaError::Computation("Dimension mismatch".into()));
         }
 
-        let data = values
-            .iter()
-            .map(|&v| FpgaValue::from_f32(v, conversion_type))
-            .collect();
+        let result = (0..self.rows)
+            .map(|i| {
+                let sum = (0..self.cols)
+                    .map(|j| {
+                        let a = self.data[i][j].as_f32();
+                        let b = vector.data[j].as_f32();
+                        a * b
+                    })
+                    .sum();
+                Ok(FpgaValue::Float(sum))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self {
-            data,
-            conversion_type,
-        })
+        Vector::new(result)
     }
 
-    /// FPGAベクトルをNumPy配列に変換
-    pub fn to_numpy(&self) -> Vec<f32> {
-        self.data.iter().map(|v| v.to_f32()).collect()
+    pub fn split_blocks(&self) -> Result<Vec<Matrix>> {
+        if self.rows % MATRIX_SIZE != 0 || self.cols % MATRIX_SIZE != 0 {
+            return Err(FpgaError::Computation("Matrix size must be multiple of block size".into()));
+        }
+
+        let mut blocks = Vec::new();
+        for i in (0..self.rows).step_by(MATRIX_SIZE) {
+            for j in (0..self.cols).step_by(MATRIX_SIZE) {
+                let block_data: Vec<Vec<FpgaValue>> = self.data[i..i + MATRIX_SIZE]
+                    .iter()
+                    .map(|row| row[j..j + MATRIX_SIZE].to_vec())
+                    .collect();
+                blocks.push(Matrix::new(block_data)?);
+            }
+        }
+        Ok(blocks)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Vector {
+    data: Vec<FpgaValue>,
+}
+
+impl Vector {
+    pub fn new(data: Vec<FpgaValue>) -> Result<Self> {
+        if data.is_empty() {
+            return Err(FpgaError::Computation("Empty vector".into()));
+        }
+        Ok(Self { data })
     }
 
-    /// ベクトルのサイズを取得
-    pub fn size(&self) -> usize {
+    pub fn from_f32(data: &[f32], converter: &DataConverter) -> Result<Self> {
+        let converted = data.iter()
+            .map(|&x| converter.convert(x))
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(converted)
+    }
+
+    pub fn len(&self) -> usize {
         self.data.len()
     }
 
-    /// 変換タイプを取得
-    pub fn conversion_type(&self) -> DataConversionType {
-        self.conversion_type
+    pub fn split(&self, block_size: usize) -> Result<Vec<Vector>> {
+        if self.len() % block_size != 0 {
+            return Err(FpgaError::Computation("Vector size must be multiple of block size".into()));
+        }
+
+        let mut blocks = Vec::new();
+        for chunk in self.data.chunks(block_size) {
+            blocks.push(Vector::new(chunk.to_vec())?);
+        }
+        Ok(blocks)
     }
 
-    /// インデックスでの値取得
-    pub fn get(&self, index: usize) -> FpgaValue {
-        self.data[index]
-    }
+    pub fn add(&self, other: &Vector) -> Result<Vector> {
+        if self.len() != other.len() {
+            return Err(FpgaError::Computation("Vector size mismatch".into()));
+        }
 
-    /// 変換タイプを変更
-    pub fn convert(&self, new_type: DataConversionType) -> Self {
-        let data = self
-            .data
-            .iter()
-            .map(|v| FpgaValue::from_f32(v.to_f32(), new_type))
+        let result = self.data.iter()
+            .zip(other.data.iter())
+            .map(|(a, b)| FpgaValue::Float(a.as_f32() + b.as_f32()))
             .collect();
 
-        Self {
-            data,
-            conversion_type: new_type,
-        }
+        Vector::new(result)
+    }
+
+    pub fn relu(&self) -> Result<Vector> {
+        let result = self.data.iter()
+            .map(|x| FpgaValue::Float(x.as_f32().max(0.0)))
+            .collect();
+        Vector::new(result)
     }
 }
 
-impl FpgaMatrix {
-    /// NumPy行列からFPGA行列を生成
-    pub fn from_numpy(
-        values: &[Vec<f32>], 
-        conversion_type: DataConversionType
-    ) -> Result<Self, MathError> {
-        // サイズチェック
-        if values.is_empty() || values.len() % MATRIX_SIZE != 0 {
-            return Err(MathError::InvalidMatrixSize {
-                rows: values.len(),
-                cols: 0,
-            });
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DataFormat;
 
-        let cols = values[0].len();
-        if cols % MATRIX_SIZE != 0 {
-            return Err(MathError::InvalidMatrixSize {
-                rows: values.len(),
-                cols,
-            });
-        }
+    #[test]
+    fn test_matrix_vector_multiplication() {
+        let converter = DataConverter::new(DataFormat::Full);
+        
+        let matrix_data = vec![
+            vec![1.0, 2.0],
+            vec![3.0, 4.0],
+        ];
+        let vector_data = vec![2.0, 1.0];
 
-        // データ変換
-        let data = values
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&v| FpgaValue::from_f32(v, conversion_type))
-                    .collect()
-            })
-            .collect();
+        let matrix = Matrix::from_f32(&matrix_data, &converter).unwrap();
+        let vector = Vector::from_f32(&vector_data, &converter).unwrap();
 
-        Ok(Self {
-            data,
-            rows: values.len(),
-            cols,
-            conversion_type,
-        })
+        let result = matrix.multiply_vector(&vector).unwrap();
+        assert_eq!(result.data[0].as_f32(), 4.0);
+        assert_eq!(result.data[1].as_f32(), 10.0);
     }
 
-    /// FPGA行列をNumPy行列に変換
-    pub fn to_numpy(&self) -> Vec<Vec<f32>> {
-        self.data
-            .iter()
-            .map(|row| row.iter().map(|v| v.to_f32()).collect())
-            .collect()
-    }
+    #[test]
+    fn test_vector_operations() {
+        let converter = DataConverter::new(DataFormat::Full);
+        
+        let v1 = Vector::from_f32(&[1.0, -2.0], &converter).unwrap();
+        let v2 = Vector::from_f32(&[2.0, 3.0], &converter).unwrap();
 
-    /// 行列を16x16のブロックに分割
-    pub fn split_into_blocks(&self) -> Vec<Vec<FpgaMatrix>> {
-        let mut blocks = Vec::new();
+        let sum = v1.add(&v2).unwrap();
+        assert_eq!(sum.data[0].as_f32(), 3.0);
+        assert_eq!(sum.data[1].as_f32(), 1.0);
 
-        for row_start in (0..self.rows).step_by(MATRIX_SIZE) {
-            let mut row_blocks = Vec::new();
-            
-            for col_start in (0..self.cols).step_by(MATRIX_SIZE) {
-                let mut block_data = Vec::new();
-                
-                // ブロックデータの抽出
-                for r in row_start..row_start + MATRIX_SIZE {
-                    let mut block_row = Vec::new();
-                    for c in col_start..col_start + MATRIX_SIZE {
-                        let value = if r < self.rows && c < self.cols {
-                            self.data[r][c]
-                        } else {
-                            FpgaValue::from_f32(0.0, self.conversion_type)
-                        };
-                        block_row.push(value);
-                    }
-                    block_data.push(block_row);
-                }
-
-                // ブロック行列の作成
-                row_blocks.push(Self {
-                    data: block_data,
-                    rows: MATRIX_SIZE,
-                    cols: MATRIX_SIZE,
-                    conversion_type: self.conversion_type,
-                });
-            }
-            blocks.push(row_blocks);
-        }
-
-        blocks
-    }
-
-    /// 行数を取得
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    /// 列数を取得
-    pub fn cols(&self) -> usize {
-        self.cols
-    }
-
-    /// 指定位置の値を取得
-    pub fn get(&self, row: usize, col: usize) -> FpgaValue {
-        self.data[row][col]
+        let relu = v1.relu().unwrap();
+        assert_eq!(relu.data[0].as_f32(), 1.0);
+        assert_eq!(relu.data[1].as_f32(), 0.0);
     }
 }
