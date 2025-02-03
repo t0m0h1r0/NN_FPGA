@@ -133,10 +133,10 @@ module mtx_unit_tb;
             op4: NOP
         };
 
-        // 共有メモリからV1にPOP
+        // 共有メモリからV1にPULL
         #80
         vliw_inst = '{
-            op1: POP_V1,
+            op1: PULL_V1,
             op2: NOP,
             op3: NOP,
             op4: NOP

@@ -68,11 +68,17 @@ accelerator.prepare_matrix(matrix)
 result = accelerator.compute_with_prepared_matrix(vector)
 ```
 
-### 2. ベクトル演算
+### 2. ベクトル演算と共有メモリ操作
 
 ```python
 # ベクトルの作成
 vector = np.random.randn(16).astype(np.float32)
+
+# ベクトルをユニット1の共有メモリに送信
+accelerator.push_vector_to_memory(vector, unit_id=1)
+
+# 別のユニットで共有メモリからデータを取得
+result = accelerator.pull_vector_from_memory(unit_id=1)
 
 # 各種演算の実行
 result_add = accelerator.compute_vector(vector, 'add')    # ベクトル + 1

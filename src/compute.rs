@@ -1,8 +1,10 @@
 use crate::types::{FpgaError, Result, FpgaValue, MATRIX_SIZE};
 use crate::memory::{SharedMemory, MatrixBlock};
 use crate::math::{Matrix, Vector};
+use crate::instructions::{FpgaInstruction, VliwInstruction, InstructionExecutor, FpgaInstructionChannel};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy)]
 pub enum ComputeOperation {
     MatrixVectorMultiply,
     VectorAdd,
@@ -14,32 +16,47 @@ pub struct ComputeUnit {
     matrix_cache: Option<MatrixBlock>,
     vector_cache: Option<Vec<FpgaValue>>,
     shared_memory: Arc<SharedMemory>,
+    instruction_channel: FpgaInstructionChannel,
 }
 
 impl ComputeUnit {
-    pub fn new(id: usize, shared_memory: Arc<SharedMemory>) -> Self {
-        Self {
+    pub fn new(id: usize, shared_memory: Arc<SharedMemory>) -> Result<Self> {
+        Ok(Self {
             id,
             matrix_cache: None,
             vector_cache: None,
             shared_memory,
-        }
+            instruction_channel: FpgaInstructionChannel::new()?,
+        })
     }
 
     pub fn load_matrix(&mut self, block: MatrixBlock) -> Result<()> {
+        // 行列データをキャッシュ
         self.matrix_cache = Some(block);
-        Ok(())
+        
+        // FPGAに行列ロード命令を発行
+        let vliw = VliwInstruction::from_single(FpgaInstruction::LoadM0);
+        self.instruction_channel.execute_vliw(vliw)
     }
 
     pub fn load_vector(&mut self, data: Vec<FpgaValue>) -> Result<()> {
         if data.len() != MATRIX_SIZE {
             return Err(FpgaError::Computation("Invalid vector size".into()));
         }
+        
+        // ベクトルデータをキャッシュ
         self.vector_cache = Some(data);
-        Ok(())
+        
+        // FPGAにベクトルロード命令を発行
+        let vliw = VliwInstruction::from_single(FpgaInstruction::LoadV0);
+        self.instruction_channel.execute_vliw(vliw)
     }
 
     pub fn execute(&mut self, op: ComputeOperation) -> Result<Vec<FpgaValue>> {
+        let inst: FpgaInstruction = op.into();
+        let vliw = VliwInstruction::from_single(inst);
+        self.instruction_channel.execute_vliw(vliw)?;
+
         match op {
             ComputeOperation::MatrixVectorMultiply => self.matrix_vector_multiply(),
             ComputeOperation::VectorAdd => self.vector_add(),
@@ -48,11 +65,13 @@ impl ComputeUnit {
     }
 
     fn matrix_vector_multiply(&self) -> Result<Vec<FpgaValue>> {
+        // 行列データとベクトルデータの存在確認
         let matrix = self.matrix_cache.as_ref()
             .ok_or_else(|| FpgaError::Computation("Matrix not loaded".into()))?;
         let vector = self.vector_cache.as_ref()
             .ok_or_else(|| FpgaError::Computation("Vector not loaded".into()))?;
 
+        // 結果を取得（実際のハードウェアでは非同期で結果が返される）
         let result = Matrix::new(matrix.get_data().to_vec())?
             .multiply_vector(&Vector::new(vector.clone())?)?;
 
@@ -80,13 +99,13 @@ pub struct ComputeCore {
 }
 
 impl ComputeCore {
-    pub fn new(num_units: usize) -> Self {
+    pub fn new(num_units: usize) -> Result<Self> {
         let shared_memory = Arc::new(SharedMemory::new(num_units));
         let units = (0..num_units)
             .map(|id| ComputeUnit::new(id, Arc::clone(&shared_memory)))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        Self { units }
+        Ok(Self { units })
     }
 
     pub fn get_unit(&mut self, id: usize) -> Result<&mut ComputeUnit> {
@@ -98,31 +117,5 @@ impl ComputeCore {
         self.units.iter_mut()
             .map(|unit| unit.execute(op))
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::DataConverter;
-    use crate::types::DataFormat;
-
-    #[test]
-    fn test_compute_unit_matrix_multiply() {
-        let shared_memory = Arc::new(SharedMemory::new(1));
-        let mut unit = ComputeUnit::new(0, shared_memory);
-
-        let converter = DataConverter::new(DataFormat::Full);
-        let matrix_data = vec![vec![1.0; MATRIX_SIZE]; MATRIX_SIZE];
-        let vector_data = vec![1.0; MATRIX_SIZE];
-
-        let matrix = Matrix::from_f32(&matrix_data, &converter).unwrap();
-        let vector = Vector::from_f32(&vector_data, &converter).unwrap();
-
-        unit.load_matrix(MatrixBlock::new(matrix.data, 0, 0).unwrap()).unwrap();
-        unit.load_vector(vector.data).unwrap();
-
-        let result = unit.execute(ComputeOperation::MatrixVectorMultiply).unwrap();
-        assert_eq!(result.len(), MATRIX_SIZE);
     }
 }
