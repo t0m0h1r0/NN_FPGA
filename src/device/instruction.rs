@@ -1,3 +1,5 @@
+//! VLIWインストラクションセットの定義
+
 /// VLIWコマンドの列挙型
 #[derive(Debug, Clone, Copy)]
 pub enum VliwCommand {
@@ -31,6 +33,7 @@ pub struct VliwInstruction {
 }
 
 impl VliwInstruction {
+    /// NOPインストラクションを生成
     pub fn nop() -> Self {
         Self {
             op1: VliwCommand::Nop,
@@ -40,6 +43,7 @@ impl VliwInstruction {
         }
     }
 
+    /// 単一の命令を含むインストラクションを生成
     pub fn single(op: VliwCommand) -> Self {
         Self {
             op1: op,
@@ -57,6 +61,7 @@ pub struct InstructionBuilder {
 }
 
 impl InstructionBuilder {
+    /// 新しいビルダーを作成
     pub fn new() -> Self {
         Self {
             inst: VliwInstruction::nop(),
@@ -64,6 +69,7 @@ impl InstructionBuilder {
         }
     }
 
+    /// 命令を追加
     pub fn add_op(&mut self, op: VliwCommand) -> &mut Self {
         if self.current_slot < 4 {
             match self.current_slot {
@@ -78,7 +84,36 @@ impl InstructionBuilder {
         self
     }
 
+    /// インストラクションを生成
     pub fn build(self) -> VliwInstruction {
         self.inst
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_instruction_builder() {
+        let inst = InstructionBuilder::new()
+            .add_op(VliwCommand::LoadV0)
+            .add_op(VliwCommand::MatrixVectorMultiply)
+            .add_op(VliwCommand::StoreV0)
+            .build();
+
+        assert!(matches!(inst.op1, VliwCommand::LoadV0));
+        assert!(matches!(inst.op2, VliwCommand::MatrixVectorMultiply));
+        assert!(matches!(inst.op3, VliwCommand::StoreV0));
+        assert!(matches!(inst.op4, VliwCommand::Nop));
+    }
+
+    #[test]
+    fn test_single_instruction() {
+        let inst = VliwInstruction::single(VliwCommand::MatrixVectorMultiply);
+        assert!(matches!(inst.op1, VliwCommand::MatrixVectorMultiply));
+        assert!(matches!(inst.op2, VliwCommand::Nop));
+        assert!(matches!(inst.op3, VliwCommand::Nop));
+        assert!(matches!(inst.op4, VliwCommand::Nop));
     }
 }

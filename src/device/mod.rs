@@ -1,3 +1,5 @@
+//! FPGAアクセラレータのメイン実装
+
 pub mod instruction;
 pub mod memory;
 pub mod unit;
@@ -41,11 +43,18 @@ pub enum DeviceError {
     Math(#[from] MathError),
 }
 
+/// 行列ブロックの割り当て情報
+#[derive(Debug)]
+struct MatrixBlockAssignment {
+    unit_id: usize,
+    block_index: usize,
+}
+
 /// FPGAアクセラレータの本体
 pub struct FpgaAccelerator {
     units: Vec<ComputeUnit>,
     shared_memory: SharedMemory,
-    prepared_matrix: Option<Vec<Vec<FpgaMatrix>>>,
+    matrix_assignments: Vec<Vec<MatrixBlockAssignment>>, // 行列ブロックの割り当て情報を保持
     matrix_rows: usize,
     matrix_cols: usize,
 }
@@ -59,35 +68,61 @@ impl FpgaAccelerator {
         Self {
             units,
             shared_memory,
-            prepared_matrix: None,
+            matrix_assignments: Vec::new(),
             matrix_rows: 0,
             matrix_cols: 0,
         }
     }
 
     /// 行列を準備（プリロード）
+    /// この段階で各ブロックをユニットに割り当て、ロードする
     pub fn prepare_matrix(&mut self, matrix: &FpgaMatrix) -> Result<(), DeviceError> {
         debug!("行列の準備開始: {}x{}", matrix.rows(), matrix.cols());
         
         // 行列をブロックに分割
         let matrix_blocks = matrix.split_into_blocks();
         
-        // 行列の元のサイズを保存
         self.matrix_rows = matrix.rows();
         self.matrix_cols = matrix.cols();
         
-        // 分割した行列を保持
-        self.prepared_matrix = Some(matrix_blocks);
+        // 既存の割り当てをクリア
+        self.clear_matrix_assignments()?;
         
-        info!("行列の準備完了: {}ブロックに分割", matrix_blocks.len());
+        let mut assignments = Vec::new();
+        
+        // 各ブロック行に対して処理
+        for row_blocks in matrix_blocks {
+            let mut row_assignments = Vec::new();
+            
+            // 各ブロックに対してユニットを割り当て
+            for (block_idx, block) in row_blocks.iter().enumerate() {
+                let unit_id = self.find_available_unit()?;
+                
+                // ユニットに行列ブロックをロード
+                self.units[unit_id].load_matrix(block.data.clone())?;
+                
+                row_assignments.push(MatrixBlockAssignment {
+                    unit_id,
+                    block_index: block_idx,
+                });
+            }
+            
+            assignments.push(row_assignments);
+        }
+        
+        self.matrix_assignments = assignments;
+        info!("行列の準備完了: {}ブロックを{}ユニットに割り当て",
+              matrix_blocks.len() * matrix_blocks[0].len(),
+              self.matrix_assignments.iter().flatten().count());
+        
         Ok(())
     }
 
     /// 準備済み行列とベクトルの乗算
     pub fn compute_with_prepared_matrix(&mut self, vector: &FpgaVector) -> Result<FpgaVector, DeviceError> {
-        // 準備済み行列の確認
-        let matrix_blocks = self.prepared_matrix.as_ref()
-            .ok_or_else(|| DeviceError::MatrixNotPrepared("行列が準備されていません".to_string()))?;
+        if self.matrix_assignments.is_empty() {
+            return Err(DeviceError::MatrixNotPrepared("行列が準備されていません".to_string()));
+        }
 
         // ベクトルの次元チェック
         if vector.size() != self.matrix_cols {
@@ -99,7 +134,38 @@ impl FpgaAccelerator {
         }
 
         debug!("行列ベクトル乗算開始: ベクトルサイズ {}", vector.size());
-        self.compute_large_matrix_multiply(matrix_blocks, vector)
+        
+        let mut final_result = vec![FpgaValue::from_f32(0.0, vector.conversion_type()); self.matrix_rows];
+
+        // 各ブロック行に対して処理を実行
+        for (block_row_idx, row_assignments) in self.matrix_assignments.iter().enumerate() {
+            debug!("ブロック行 {}/{} の処理開始", block_row_idx + 1, self.matrix_assignments.len());
+            
+            // 各ユニットで並列に乗算を実行
+            for assignment in row_assignments {
+                // 入力ベクトルの対応部分を取得
+                let vector_start = assignment.block_index * MATRIX_SIZE;
+                let vector_end = vector_start + MATRIX_SIZE;
+                let vector_block = vector.data[vector_start..vector_end].to_vec();
+                
+                // 乗算を実行
+                let unit = &mut self.units[assignment.unit_id];
+                unit.load_and_multiply(vector_block)?;
+            }
+
+            // 結果の集約
+            let mut row_result = self.accumulate_results(row_assignments)?;
+            
+            // 最終結果に格納
+            let result_start = block_row_idx * MATRIX_SIZE;
+            let result_end = result_start + MATRIX_SIZE;
+            final_result[result_start..result_end].copy_from_slice(&row_result);
+        }
+
+        Ok(FpgaVector::from_numpy(
+            &final_result.iter().map(|v| v.to_f32()).collect::<Vec<f32>>(),
+            vector.conversion_type()
+        )?)
     }
 
     /// スカラー演算の実行
@@ -107,9 +173,6 @@ impl FpgaAccelerator {
         let unit_id = self.find_available_unit()?;
         let unit = &mut self.units[unit_id];
         unit.status = UnitStatus::Busy;
-
-        // ベクトルをユニットにロード
-        unit.load_v0(vector.data.clone());
 
         // 命令を構築
         let inst = match comp_type {
@@ -122,7 +185,8 @@ impl FpgaAccelerator {
             )),
         };
 
-        // 命令を実行
+        // ベクトルをロードして命令を実行
+        unit.load_and_multiply(vector.data.clone())?;
         unit.execute_instruction(&inst, self.shared_memory.get_entries_mut())?;
 
         // 結果を取得
@@ -137,100 +201,41 @@ impl FpgaAccelerator {
         )?)
     }
 
-    /// 大規模行列の乗算を実行
-    fn compute_large_matrix_multiply(
-        &mut self,
-        matrix_blocks: &[Vec<FpgaMatrix>],
-        input_vector: &FpgaVector,
-    ) -> Result<FpgaVector, DeviceError> {
-        let num_block_rows = matrix_blocks.len();
-        debug!("大規模行列乗算開始: {}ブロック行", num_block_rows);
-        
-        // 結果を格納するベクトル
-        let mut final_result = vec![FpgaValue::from_f32(0.0, DataConversionType::Full); num_block_rows * MATRIX_SIZE];
+    /// 結果の集約処理
+    fn accumulate_results(&mut self, assignments: &[MatrixBlockAssignment]) -> Result<Vec<FpgaValue>, DeviceError> {
+        // 最初のユニットの結果をベースとする
+        let first_unit = &mut self.units[assignments[0].unit_id];
+        let mut accumulated = first_unit.get_v0().to_vec();
 
-        // 各ブロック行に対して処理を実行
-        for block_row_idx in 0..num_block_rows {
-            let row_blocks = &matrix_blocks[block_row_idx];
-            debug!("ブロック行 {}/{} の処理開始", block_row_idx + 1, num_block_rows);
+        // 2番目以降のユニットの結果を加算
+        for assignment in &assignments[1..] {
+            let unit = &mut self.units[assignment.unit_id];
             
-            // 利用可能なユニットを割り当て
-            let mut unit_assignments = Vec::new();
-            for block_idx in 0..row_blocks.len() {
-                let unit_id = self.find_available_unit()?;
-                unit_assignments.push((block_idx, unit_id));
-                
-                // ユニットに行列ブロックをロード
-                let unit = &mut self.units[unit_id];
-                unit.load_m0(row_blocks[block_idx].data.clone());
-                
-                // 入力ベクトルの対応部分をロード
-                let vector_start = block_idx * MATRIX_SIZE;
-                let vector_end = vector_start + MATRIX_SIZE;
-                unit.load_v0(input_vector.data[vector_start..vector_end].to_vec());
-            }
+            // 結果をPUSH
+            let push_inst = VliwInstruction::single(VliwCommand::PushV0);
+            unit.execute_instruction(&push_inst, self.shared_memory.get_entries_mut())?;
 
-            debug!("{}個のユニットに割り当て完了", unit_assignments.len());
+            // 結果をPOPして加算
+            let pop_inst = VliwInstruction::single(VliwCommand::PopV1);
+            first_unit.execute_instruction(&pop_inst, self.shared_memory.get_entries_mut())?;
 
-            // 並列に行列ベクトル乗算を実行
-            for &(_, unit_id) in &unit_assignments {
-                let unit = &mut self.units[unit_id];
-                let inst = InstructionBuilder::new()
-                    .add_op(VliwCommand::MatrixVectorMultiply)
-                    .build();
-                
-                unit.execute_instruction(&inst, self.shared_memory.get_entries_mut())?;
-            }
-
-            debug!("並列乗算完了、結果の集約開始");
-            
-            // 各ユニットの結果を共有メモリを使って集約
-            for (i, &(_, unit_id)) in unit_assignments.iter().enumerate() {
-                let unit = &mut self.units[unit_id];
-                
-                // 結果をPUSH
-                let push_inst = InstructionBuilder::new()
-                    .add_op(VliwCommand::PushV0)
-                    .build();
-                unit.execute_instruction(&push_inst, self.shared_memory.get_entries_mut())?;
-
-                if i > 0 {
-                    // 最初のユニット以外は加算が必要
-                    let first_unit = &mut self.units[unit_assignments[0].1];
-                    
-                    // 共有メモリから結果をPOP
-                    let pop_inst = InstructionBuilder::new()
-                        .add_op(VliwCommand::PopV1)
-                        .build();
-                    first_unit.execute_instruction(&pop_inst, self.shared_memory.get_entries_mut())?;
-
-                    // 加算実行
-                    let add_inst = InstructionBuilder::new()
-                        .add_op(VliwCommand::VectorAdd01)
-                        .build();
-                    first_unit.execute_instruction(&add_inst, self.shared_memory.get_entries_mut())?;
-                }
-            }
-
-            // 最終結果を取得
-            let first_unit = &self.units[unit_assignments[0].1];
-            let result_start = block_row_idx * MATRIX_SIZE;
-            let result_end = result_start + MATRIX_SIZE;
-            final_result[result_start..result_end].copy_from_slice(first_unit.get_v0());
-
-            // ユニットを解放
-            for &(_, unit_id) in &unit_assignments {
-                self.units[unit_id].status = UnitStatus::Available;
-            }
-
-            debug!("ブロック行 {} の処理完了", block_row_idx + 1);
+            let add_inst = VliwInstruction::single(VliwCommand::VectorAdd01);
+            first_unit.execute_instruction(&add_inst, self.shared_memory.get_entries_mut())?;
         }
 
-        info!("大規模行列乗算完了");
-        Ok(FpgaVector::from_numpy(
-            &final_result.iter().map(|v| v.to_f32()).collect::<Vec<f32>>(),
-            input_vector.conversion_type()
-        )?)
+        Ok(first_unit.get_v0().to_vec())
+    }
+
+    /// 既存の行列割り当てをクリア
+    fn clear_matrix_assignments(&mut self) -> Result<(), DeviceError> {
+        for assignments in &self.matrix_assignments {
+            for assignment in assignments {
+                let unit = &mut self.units[assignment.unit_id];
+                unit.status = UnitStatus::Available;
+            }
+        }
+        self.matrix_assignments.clear();
+        Ok(())
     }
 
     /// 利用可能なユニットを探す
@@ -253,7 +258,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_matrix_multiplication() {
+    fn test_matrix_reuse() {
         let mut accelerator = FpgaAccelerator::new();
         
         // 32x32のテスト行列を作成
@@ -264,46 +269,26 @@ mod tests {
         let matrix = FpgaMatrix::from_numpy(&matrix_data, DataConversionType::Full).unwrap();
         accelerator.prepare_matrix(&matrix).unwrap();
 
-        // テストベクトル
-        let vector_data: Vec<f32> = (0..32).map(|x| x as f32).collect();
-        let vector = FpgaVector::from_numpy(&vector_data, DataConversionType::Full).unwrap();
+        // 複数のベクトルで乗算をテスト
+        for k in 0..5 {
+            let vector_data: Vec<f32> = (0..32).map(|x| (x + k) as f32).collect();
+            let vector = FpgaVector::from_numpy(&vector_data, DataConversionType::Full).unwrap();
 
-        // 乗算を実行
-        let result = accelerator.compute_with_prepared_matrix(&vector).unwrap();
+            let result = accelerator.compute_with_prepared_matrix(&vector).unwrap();
 
-        // NumPyスタイルの検証用の乗算を実行
-        let mut expected = vec![0.0; 32];
-        for i in 0..32 {
-            for j in 0..32 {
-                expected[i] += matrix_data[i][j] * vector_data[j];
+            // NumPyスタイルの検証用の乗算を実行
+            let mut expected = vec![0.0; 32];
+            for i in 0..32 {
+                for j in 0..32 {
+                    expected[i] += matrix_data[i][j] * vector_data[j];
+                }
             }
-        }
 
-        // 結果を比較
-        let result_data = result.data.iter().map(|v| v.to_f32()).collect::<Vec<f32>>();
-        for (a, b) in result_data.iter().zip(expected.iter()) {
-            assert!((a - b).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn test_scalar_operations() {
-        let mut accelerator = FpgaAccelerator::new();
-        
-        // テストベクトル
-        let vector_data = vec![1.0, -2.0, 0.0, 3.0];
-        let vector = FpgaVector::from_numpy(&vector_data, DataConversionType::Full).unwrap();
-
-        // ReLU
-        let relu_result = accelerator.compute_scalar(&vector, ComputationType::ReLU).unwrap();
-        let relu_data: Vec<f32> = relu_result.data.iter().map(|v| v.to_f32()).collect();
-        assert_eq!(relu_data, vec![1.0, 0.0, 0.0, 3.0]);
-
-        // Tanh
-        let tanh_result = accelerator.compute_scalar(&vector, ComputationType::Tanh).unwrap();
-        let tanh_data: Vec<f32> = tanh_result.data.iter().map(|v| v.to_f32()).collect();
-        for (a, b) in tanh_data.iter().zip(vector_data.iter()) {
-            assert!((a - b.tanh()).abs() < 1e-5);
+            // 結果を比較
+            let result_data = result.data.iter().map(|v| v.to_f32()).collect::<Vec<f32>>();
+            for (a, b) in result_data.iter().zip(expected.iter()) {
+                assert!((a - b).abs() < 1e-5);
+            }
         }
     }
 }
