@@ -23,65 +23,70 @@ impl FpgaAccelerator {
         })
     }
 
-    // 最適化された行列準備処理
+    // ブロードキャストベースの最適化された行列準備処理
     pub fn prepare_matrix(&mut self, matrix: &Matrix) -> Result<()> {
         self.matrix_rows = matrix.rows();
         self.matrix_cols = matrix.cols();
 
         // 行列をブロックに分割
         let blocks = matrix.split_blocks()?;
+        let num_units = self.compute_core.num_units();
         
-        // ユニットごとのブロック数を計算
-        let blocks_per_unit = (blocks.len() + self.compute_core.num_units() - 1) 
-            / self.compute_core.num_units();
-
-        // 各ユニットに対して並列にブロックをロード
-        for chunk_idx in 0..blocks_per_unit {
-            let vliw_instructions = self.generate_parallel_load_instructions(
-                &blocks,
-                chunk_idx,
-                self.compute_core.num_units()
-            )?;
-
-            // VLIWパケットを一括実行
-            for vliw in vliw_instructions {
-                self.instruction_channel.execute_vliw(vliw)?;
+        // 各ブロックグループについて処理
+        for block_group_idx in 0..(blocks.len() + num_units - 1) / num_units {
+            let start_idx = block_group_idx * num_units;
+            let end_idx = std::cmp::min(start_idx + num_units, blocks.len());
+            
+            // このグループの各ブロックを共有メモリを介して配布
+            for block_idx in start_idx..end_idx {
+                self.broadcast_matrix_block(&blocks[block_idx], block_idx)?;
             }
         }
 
         Ok(())
     }
 
-    // 並列ロード用VLIW命令生成
-    fn generate_parallel_load_instructions(
-        &self,
-        blocks: &[Matrix],
-        chunk_idx: usize,
-        num_units: usize
-    ) -> Result<Vec<VliwInstruction>> {
-        let mut instructions = Vec::new();
-        
-        // 初期化用VLIW命令（複数ユニットを同時に初期化）
-        let mut init_vliw = VliwInstruction::new(
-            FpgaInstruction::ZERO_M0,
-            FpgaInstruction::ZERO_M0,
-            FpgaInstruction::ZERO_M0,
-            FpgaInstruction::ZERO_M0
-        );
-        instructions.push(init_vliw);
+    // ブロックの共有メモリを介したブロードキャスト
+    fn broadcast_matrix_block(&mut self, block: &Matrix, block_idx: usize) -> Result<()> {
+        // Step 1: ブロックをマスターユニット(0)の共有メモリ領域にロード
+        let master_unit = self.compute_core.get_unit(0)?;
+        let matrix_block = MatrixBlock::new(
+            block.data.clone(),
+            block_idx * MATRIX_SIZE,
+            0,
+        )?;
 
-        // ロード用VLIW命令（4ユニットずつ並列ロード）
-        for unit_group in (0..num_units).step_by(4) {
-            let mut load_vliw = VliwInstruction::new(
-                FpgaInstruction::LoadM0,
-                if unit_group + 1 < num_units { FpgaInstruction::LoadM0 } else { FpgaInstruction::Nop },
-                if unit_group + 2 < num_units { FpgaInstruction::LoadM0 } else { FpgaInstruction::Nop },
-                if unit_group + 3 < num_units { FpgaInstruction::LoadM0 } else { FpgaInstruction::Nop }
-            );
-            instructions.push(load_vliw);
+        // マスターユニットにブロックをロード
+        let load_vliw = VliwInstruction::new(
+            FpgaInstruction::LoadM0,    // 行列ブロックをロード
+            FpgaInstruction::PushM0,    // 共有メモリに書き込み
+            FpgaInstruction::Nop,
+            FpgaInstruction::Nop
+        );
+        self.instruction_channel.execute_vliw(load_vliw)?;
+
+        // Step 2: 各ユニットが共有メモリから必要なブロックを取得
+        let pull_vliw = VliwInstruction::new(
+            FpgaInstruction::ZERO_M0,   // まず初期化
+            FpgaInstruction::PULL_M0,   // 共有メモリからブロックを取得
+            FpgaInstruction::Nop,
+            FpgaInstruction::Nop
+        );
+
+        // 並列にブロックを取得（4ユニットずつ）
+        for unit_group in (0..self.compute_core.num_units()).step_by(4) {
+            let mut group_vliw = pull_vliw.clone();
+            
+            // グループ内の各ユニットに対してPULL命令を設定
+            for i in 0..4 {
+                if unit_group + i < self.compute_core.num_units() {
+                    let unit = self.compute_core.get_unit(unit_group + i)?;
+                    self.instruction_channel.execute_vliw(group_vliw)?;
+                }
+            }
         }
 
-        Ok(instructions)
+        Ok(())
     }
 
     // 最適化された行列ベクトル乗算
@@ -101,14 +106,14 @@ impl FpgaAccelerator {
                 self.compute_core.num_units()
             );
 
-            // FPGA上での並列計算とリダクション実行
-            self.execute_pipelined_computation(
+            // ベクトルブロックの配布と計算（ブロードキャスト）
+            self.broadcast_and_compute(
                 &vector_blocks,
                 units_in_row,
                 block_row
             )?;
 
-            // 最終結果の取得（ユニット0から）
+            // 結果の収集（ツリー状リダクション）
             let row_result = self.get_final_result()?;
             final_result.extend_from_slice(&row_result);
         }
@@ -116,59 +121,63 @@ impl FpgaAccelerator {
         Vector::new(final_result)
     }
 
-    // FPGA上での並列計算実行とリダクション
-    fn execute_pipelined_computation(
+    // ベクトルブロックの配布と計算
+    fn broadcast_and_compute(
         &mut self,
         vector_blocks: &[Vector],
         units_in_row: usize,
         block_row: usize
     ) -> Result<()> {
-        // 第1フェーズ: 各ユニットでの並列計算
-        for unit_id in 0..units_in_row {
-            let unit = self.compute_core.get_unit(unit_id)?;
-            
-            // 計算とPUSH操作を1つのVLIWパケットで実行
-            let vliw = VliwInstruction::new(
-                FpgaInstruction::LoadV0,          // ベクトルロード
-                FpgaInstruction::MatrixVectorMul, // 行列ベクトル乗算
-                FpgaInstruction::PushV0,         // 結果を共有メモリへ
+        // Step 1: ベクトルをマスターユニットの共有メモリ領域にブロードキャスト
+        let master_vliw = VliwInstruction::new(
+            FpgaInstruction::LoadV0,   // ベクトルをロード
+            FpgaInstruction::PushV0,   // 共有メモリに書き込み
+            FpgaInstruction::Nop,
+            FpgaInstruction::Nop
+        );
+        self.instruction_channel.execute_vliw(master_vliw)?;
+
+        // Step 2: 各ユニットが共有メモリからベクトルを取得し計算
+        for unit_group in (0..units_in_row).step_by(4) {
+            let compute_vliw = VliwInstruction::new(
+                FpgaInstruction::PULL_V0,         // 共有メモリからベクトル取得
+                FpgaInstruction::MatrixVectorMul, // 行列ベクトル乗算実行
+                FpgaInstruction::PushV0,         // 結果を共有メモリに書き戻し
                 FpgaInstruction::Nop
             );
-            self.instruction_channel.execute_vliw(vliw)?;
+
+            // グループ内の各ユニットで並列実行
+            for i in 0..4 {
+                if unit_group + i < units_in_row {
+                    self.instruction_channel.execute_vliw(compute_vliw)?;
+                }
+            }
         }
 
-        // 第2フェーズ: ツリー構造でのリダクション
+        // Step 3: ツリー構造でのリダクション
         let mut active_units = units_in_row;
         let mut stride = 1;
 
         while active_units > 1 {
-            // 並列リダクションの各レベル
             for i in 0..(active_units / 2) {
-                let target_unit = i;
-                let source_unit = i + stride;
-
-                // リダクション用VLIW命令パケット
                 let reduction_vliw = VliwInstruction::new(
-                    FpgaInstruction::PULL_V1,     // 共有メモリから第2オペランドを取得
-                    FpgaInstruction::VADD_01,     // V0 += V1を実行
-                    FpgaInstruction::PUSH_V0,     // 結果を共有メモリへ書き戻し
+                    FpgaInstruction::PULL_V1,     // 共有メモリから第2オペランド取得
+                    FpgaInstruction::VADD_01,     // V0 += V1実行
+                    FpgaInstruction::PushV0,      // 結果を共有メモリに書き戻し
                     FpgaInstruction::Nop
                 );
                 self.instruction_channel.execute_vliw(reduction_vliw)?;
             }
 
-            // 次のレベルの準備
             active_units = (active_units + 1) / 2;
             stride *= 2;
         }
 
-        // 最終結果はユニット0の共有メモリ領域に格納されている
         Ok(())
     }
 
-    // 最終結果の取得（ホストへの転送）
+    // 最終結果の取得
     fn get_final_result(&mut self) -> Result<Vec<FpgaValue>> {
-        // ユニット0から最終結果を取得
         let vliw = VliwInstruction::from_single(FpgaInstruction::PULL_V0);
         self.instruction_channel.execute_vliw(vliw)?;
         
@@ -178,72 +187,6 @@ impl FpgaAccelerator {
             None => Err(FpgaError::Computation("No result data available".into()))
         }
     }
-
-    // ベクトル演算の実行
-    pub fn compute_vector_operation(
-        &mut self,
-        vector: &Vector,
-        operation: ComputeOperation
-    ) -> Result<Vector> {
-        // ベクトルをブロックに分割
-        let vector_blocks = vector.split(MATRIX_SIZE)?;
-        let mut result = Vec::new();
-
-        for (unit_id, block) in vector_blocks.iter().enumerate() {
-            if let Some(unit) = self.compute_core.get_unit(unit_id) {
-                // ベクトルデータをロード
-                unit.load_vector(block.data.clone())?;
-
-                // 対応するFPGA命令を取得
-                let inst: FpgaInstruction = operation.into();
-                
-                // VLIW命令を構築
-                let vliw = VliwInstruction::new(
-                    FpgaInstruction::LoadV0,
-                    inst,
-                    FpgaInstruction::StoreV0,
-                    FpgaInstruction::Nop
-                );
-                
-                // 命令を実行
-                self.instruction_channel.execute_vliw(vliw)?;
-                
-                // 結果を取得
-                let block_result = unit.execute(operation)?;
-                result.extend_from_slice(&block_result);
-            }
-        }
-
-        Vector::new(result)
-    }
-    
-    pub fn pull_vector_from_memory(&mut self, unit_id: usize) -> Result<Vector> {
-        // 指定されたユニットを取得
-        let unit = self.compute_core.get_unit(unit_id)?;
-        
-        // PULL命令を発行
-        let vliw = VliwInstruction::from_single(FpgaInstruction::PullV0);
-        self.instruction_channel.execute_vliw(vliw)?;
-        
-        // 結果を取得
-        match &unit.vector_cache {
-            Some(data) => Vector::new(data.clone()),
-            None => Err(FpgaError::Computation("No vector data in cache".into()))
-        }
-    }
-
-    pub fn push_vector_to_memory(
-        &mut self,
-        vector: &Vector,
-        unit_id: usize
-    ) -> Result<()> {
-        let unit = self.compute_core.get_unit(unit_id)?;
-        
-        // ベクトルをロードしてPUSH
-        unit.load_vector(vector.data.clone())?;
-        let vliw = VliwInstruction::from_single(FpgaInstruction::PushV0);
-        self.instruction_channel.execute_vliw(vliw)
-    }
 }
 
 #[cfg(test)]
@@ -252,7 +195,7 @@ mod tests {
     use crate::types::DataFormat;
 
     #[test]
-    fn test_parallel_matrix_computation() -> Result<()> {
+    fn test_broadcast_matrix_computation() -> Result<()> {
         let converter = DataConverter::new(DataFormat::Full);
         let mut accelerator = FpgaAccelerator::new(4, converter.clone())?;
 
@@ -267,43 +210,6 @@ mod tests {
         let result = accelerator.compute_matrix_vector(&vector)?;
 
         assert_eq!(result.len(), 64);
-        Ok(())
-    }
-
-    #[test]
-    fn test_vector_operations() -> Result<()> {
-        let converter = DataConverter::new(DataFormat::Full);
-        let mut accelerator = FpgaAccelerator::new(4, converter.clone())?;
-
-        // 基本的なベクトル演算のテスト
-        let vector_data = vec![1.0; 16];
-        let vector = Vector::from_f32(&vector_data, &converter)?;
-
-        // ReLU演算のテスト
-        let result = accelerator.compute_vector_operation(
-            &vector,
-            ComputeOperation::VectorReLU
-        )?;
-
-        assert_eq!(result.len(), 16);
-        Ok(())
-    }
-
-    #[test]
-    fn test_shared_memory_operations() -> Result<()> {
-        let converter = DataConverter::new(DataFormat::Full);
-        let mut accelerator = FpgaAccelerator::new(4, converter.clone())?;
-
-        // 共有メモリ操作のテスト
-        let vector_data = vec![1.0; 16];
-        let vector = Vector::from_f32(&vector_data, &converter)?;
-
-        // ユニット1にプッシュ
-        accelerator.push_vector_to_memory(&vector, 1)?;
-
-        // ユニット1からプル
-        let result = accelerator.pull_vector_from_memory(1)?;
-        assert_eq!(result.len(), 16);
         Ok(())
     }
 }
