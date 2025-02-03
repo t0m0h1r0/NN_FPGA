@@ -1,7 +1,5 @@
-//! FPGA演算ユニットの実装
-
 use crate::types::{FpgaValue, DataConversionType, MATRIX_SIZE, VECTOR_SIZE};
-use super::instruction::{VliwCommand, VliwInstruction};
+use crate::instruction::{VliwCommand, VliwInstruction};
 use super::memory::SharedMemoryEntry;
 use thiserror::Error;
 
@@ -17,24 +15,24 @@ pub enum UnitError {
     MatrixNotLoaded,
 }
 
-/// FPGAユニットの状態
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnitStatus {
     Available,
     Busy,
-    MatrixLoaded,  // 行列がロード済みの状態を追加
+    MatrixLoaded,
     Error,
 }
 
-/// FPGAユニットの構造体
 #[derive(Debug)]
 pub struct ComputeUnit {
     pub id: usize,
     pub status: UnitStatus,
-    v0: Vec<FpgaValue>,  // ベクトルレジスタ0
-    v1: Vec<FpgaValue>,  // ベクトルレジスタ1
-    m0: Vec<Vec<FpgaValue>>,  // 行列レジスタ
-    matrix_loaded: bool,  // 行列がロード済みかのフラグ
+    v0: Vec<FpgaValue>,
+    v1: Vec<FpgaValue>,
+    m0: Vec<Vec<FpgaValue>>,
+    matrix_loaded: bool,
+    prepared_vector: Option<Vec<f32>>,
+    prepared_vector_type: Option<DataConversionType>,
 }
 
 impl ComputeUnit {
@@ -46,10 +44,11 @@ impl ComputeUnit {
             v1: vec![FpgaValue::from_f32(0.0, DataConversionType::Full); VECTOR_SIZE],
             m0: vec![vec![FpgaValue::from_f32(0.0, DataConversionType::Full); MATRIX_SIZE]; MATRIX_SIZE],
             matrix_loaded: false,
+            prepared_vector: None,
+            prepared_vector_type: None,
         }
     }
 
-    /// 行列をロード
     pub fn load_matrix(&mut self, matrix_data: Vec<Vec<FpgaValue>>) -> Result<(), UnitError> {
         if self.status != UnitStatus::Available {
             return Err(UnitError::InvalidInstruction);
@@ -60,8 +59,7 @@ impl ComputeUnit {
         Ok(())
     }
 
-    /// ベクトルをロードして乗算を実行
-    pub fn load_and_multiply(&mut self, vector_data: Vec<FpgaValue>) -> Result<(), UnitError> {
+    pub fn load_and_multiply(&mut self, vector_data: &[FpgaValue]) -> Result<(), UnitError> {
         if !self.matrix_loaded {
             return Err(UnitError::MatrixNotLoaded);
         }
@@ -70,94 +68,74 @@ impl ComputeUnit {
         }
 
         // ベクトルをロード
-        self.v0 = vector_data;
+        self.v0 = vector_data.to_vec();
         self.status = UnitStatus::Busy;
 
         // 行列ベクトル乗算を実行
         self.execute_matrix_vector_multiply()?;
 
-        // 状態を行列ロード済みに戻す（次の乗算に備える）
+        // 状態を行列ロード済みに戻す
         self.status = UnitStatus::MatrixLoaded;
         Ok(())
     }
 
-    /// レジスタの内容を取得
-    pub fn get_v0(&self) -> &[FpgaValue] {
-        &self.v0
+    pub fn set_prepared_vector(&mut self, vector_data: Vec<f32>) -> Result<(), UnitError> {
+        self.prepared_vector = Some(vector_data);
+        self.prepared_vector_type = Some(DataConversionType::Full); // デフォルト
+        Ok(())
     }
 
-    pub fn get_v1(&self) -> &[FpgaValue] {
-        &self.v1
+    pub fn get_prepared_vector_type(&self) -> DataConversionType {
+        self.prepared_vector_type.unwrap_or(DataConversionType::Full)
     }
 
-    pub fn get_m0(&self) -> &[Vec<FpgaValue>] {
-        &self.m0
+    pub fn load_and_multiply_prepared_vector(&mut self) -> Result<(), UnitError> {
+        if self.prepared_vector.is_none() {
+            return Err(UnitError::InvalidInstruction);
+        }
+
+        self.v0 = self.prepared_vector.as_ref().unwrap()
+            .iter()
+            .map(|&v| FpgaValue::from_f32(v, self.get_prepared_vector_type()))
+            .collect();
+        
+        self.execute_matrix_vector_multiply()?;
+        Ok(())
     }
 
-    /// VLIW命令を実行
-    pub fn execute_instruction(&mut self, inst: &VliwInstruction, shared_memory: &mut [SharedMemoryEntry]) -> Result<(), UnitError> {
-        // 4段のVLIW命令を順番に実行
-        for op in [inst.op1, inst.op2, inst.op3, inst.op4] {
-            match op {
-                VliwCommand::Nop => {},
-                VliwCommand::LoadV0 => {},  // 外部からのロード命令は別途実装
-                VliwCommand::LoadV1 => {},
-                VliwCommand::LoadM0 => {},
-                VliwCommand::StoreV0 => {},
-                VliwCommand::StoreV1 => {},
-                VliwCommand::StoreM0 => {},
-                VliwCommand::ZeroV0 => {
-                    self.v0.fill(FpgaValue::from_f32(0.0, DataConversionType::Full));
-                },
-                VliwCommand::ZeroV1 => {
-                    self.v1.fill(FpgaValue::from_f32(0.0, DataConversionType::Full));
-                },
-                VliwCommand::ZeroM0 => {
-                    for row in self.m0.iter_mut() {
-                        row.fill(FpgaValue::from_f32(0.0, DataConversionType::Full));
-                    }
-                    self.matrix_loaded = false;
-                },
-                VliwCommand::PushV0 => {
-                    shared_memory[self.id] = SharedMemoryEntry {
-                        data: self.v0.clone(),
-                        valid: true,
-                    };
-                },
-                VliwCommand::PopV1 => {
-                    if shared_memory[self.id].valid {
-                        self.v1 = shared_memory[self.id].data.clone();
-                    }
-                },
-                VliwCommand::PopV0 => {  // 【新規追加】
-                    if shared_memory[self.id].valid {
-                        self.v0 = shared_memory[self.id].data.clone();
-                    }
-                },
-                VliwCommand::MatrixVectorMultiply => {
-                    self.execute_matrix_vector_multiply()?;
-                },
-                VliwCommand::VectorAdd01 => {
-                    self.execute_vector_add()?;
-                },
-                VliwCommand::VectorSub01 => {
-                    self.execute_vector_sub()?;
-                },
-                VliwCommand::VectorReLU => {
-                    self.execute_vector_relu()?;
-                },
-                VliwCommand::VectorTanh => {
-                    self.execute_vector_tanh()?;
-                },
-                VliwCommand::VectorSquare => {
-                    self.execute_vector_square()?;
-                },
-            }
+    pub fn reset(&mut self) -> Result<(), UnitError> {
+        self.v0.fill(FpgaValue::from_f32(0.0, DataConversionType::Full));
+        self.v1.fill(FpgaValue::from_f32(0.0, DataConversionType::Full));
+        Ok(())
+    }
+
+    pub fn execute_push_v0(&mut self) -> Result<(), UnitError> {
+        // 共有メモリへのpush（実際の実装は外部で行う）
+        Ok(())
+    }
+
+    pub fn execute_pop_v0(&mut self) -> Result<(), UnitError> {
+        // 共有メモリからのv0へのpop（実際の実装は外部で行う）
+        Ok(())
+    }
+
+    pub fn execute_pop_v1(&mut self) -> Result<(), UnitError> {
+        // 共有メモリからのv1へのpop（実際の実装は外部で行う）
+        Ok(())
+    }
+
+    pub fn execute_vector_add(&mut self) -> Result<(), UnitError> {
+        for i in 0..VECTOR_SIZE {
+            let sum = self.v0[i].to_f32() + self.v1[i].to_f32();
+            self.v0[i] = FpgaValue::from_f32(sum, DataConversionType::Full);
         }
         Ok(())
     }
 
-    // 行列ベクトル乗算の実行
+    pub fn get_v0(&self) -> &[FpgaValue] {
+        &self.v0
+    }
+
     fn execute_matrix_vector_multiply(&mut self) -> Result<(), UnitError> {
         if !self.matrix_loaded {
             return Err(UnitError::MatrixNotLoaded);
@@ -171,114 +149,11 @@ impl ComputeUnit {
                 result[i] += m_val * v_val;
             }
         }
+        
         self.v0 = result.iter()
             .map(|&x| FpgaValue::from_f32(x, DataConversionType::Full))
             .collect();
+        
         Ok(())
-    }
-
-    // ベクトル加算の実行
-    fn execute_vector_add(&mut self) -> Result<(), UnitError> {
-        for i in 0..VECTOR_SIZE {
-            let sum = self.v0[i].to_f32() + self.v1[i].to_f32();
-            self.v0[i] = FpgaValue::from_f32(sum, DataConversionType::Full);
-        }
-        Ok(())
-    }
-
-    // ベクトル減算の実行
-    fn execute_vector_sub(&mut self) -> Result<(), UnitError> {
-        for i in 0..VECTOR_SIZE {
-            let diff = self.v0[i].to_f32() - self.v1[i].to_f32();
-            self.v0[i] = FpgaValue::from_f32(diff, DataConversionType::Full);
-        }
-        Ok(())
-    }
-
-    // ベクトルReLUの実行
-    fn execute_vector_relu(&mut self) -> Result<(), UnitError> {
-        for i in 0..VECTOR_SIZE {
-            let val = self.v0[i].to_f32();
-            self.v0[i] = FpgaValue::from_f32(val.max(0.0), DataConversionType::Full);
-        }
-        Ok(())
-    }
-
-    // ベクトルtanhの実行
-    fn execute_vector_tanh(&mut self) -> Result<(), UnitError> {
-        for i in 0..VECTOR_SIZE {
-            let val = self.v0[i].to_f32();
-            self.v0[i] = FpgaValue::from_f32(val.tanh(), DataConversionType::Full);
-        }
-        Ok(())
-    }
-
-    // ベクトル二乗の実行
-    fn execute_vector_square(&mut self) -> Result<(), UnitError> {
-        for i in 0..VECTOR_SIZE {
-            let val = self.v0[i].to_f32();
-            self.v0[i] = FpgaValue::from_f32(val * val, DataConversionType::Full);
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_pop_v0_instruction() {
-        let mut unit = ComputeUnit::new(0);
-        let mut shared_memory = vec![SharedMemoryEntry { data: Vec::new(), valid: false }; 1];
-
-        // テストデータの準備
-        let test_data: Vec<FpgaValue> = (0..VECTOR_SIZE)
-            .map(|i| FpgaValue::from_f32(i as f32, DataConversionType::Full))
-            .collect();
-
-        // 共有メモリにデータを設定
-        shared_memory[0] = SharedMemoryEntry {
-            data: test_data.clone(),
-            valid: true,
-        };
-
-        // PopV0命令を実行
-        let pop_inst = VliwInstruction {
-            op1: VliwCommand::PopV0,
-            op2: VliwCommand::Nop,
-            op3: VliwCommand::Nop,
-            op4: VliwCommand::Nop,
-        };
-
-        // 命令実行
-        assert!(unit.execute_instruction(&pop_inst, &mut shared_memory).is_ok());
-
-        // 結果の検証
-        for (i, val) in unit.get_v0().iter().enumerate() {
-            assert_eq!(val.to_f32(), i as f32);
-        }
-    }
-
-    #[test]
-    fn test_pop_v0_with_invalid_memory() {
-        let mut unit = ComputeUnit::new(0);
-        let mut shared_memory = vec![SharedMemoryEntry { data: Vec::new(), valid: false }; 1];
-
-        // PopV0命令を実行
-        let pop_inst = VliwInstruction {
-            op1: VliwCommand::PopV0,
-            op2: VliwCommand::Nop,
-            op3: VliwCommand::Nop,
-            op4: VliwCommand::Nop,
-        };
-
-        // 命令実行（メモリが無効な場合）
-        assert!(unit.execute_instruction(&pop_inst, &mut shared_memory).is_ok());
-
-        // 結果の検証（変更がないことを確認）
-        for val in unit.get_v0() {
-            assert_eq!(val.to_f32(), 0.0);
-        }
     }
 }
