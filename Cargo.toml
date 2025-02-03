@@ -18,3 +18,10 @@ half = "2.2"
 
 [build-dependencies]
 pyo3-build-config = "0.20"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "benchmark"
+harness = false
