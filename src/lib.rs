@@ -8,31 +8,36 @@ mod math;
 mod compute;
 mod device;
 
-use types::{DataConverter, DataFormat, FpgaError};
+use types::{DataConverter, QFormat, FpgaError};
 use math::{Matrix, Vector};
 use device::FpgaAccelerator;
 
 #[pyclass]
 struct PyFpgaAccelerator {
     inner: FpgaAccelerator,
-    converter: DataConverter,
+    q_format: QFormat,
 }
 
 #[pymethods]
 impl PyFpgaAccelerator {
     #[new]
-    fn new(precision: Option<&str>) -> PyResult<Self> {
-        let format = match precision.unwrap_or("full") {
-            "full" => DataFormat::Full,
-            "fixed" => DataFormat::Fixed { scale: 31 },
-            "trinary" => DataFormat::Trinary,
-            _ => return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("不正な精度指定")),
-        };
+    fn new(q: Option<u8>, int: Option<u8>) -> PyResult<Self> {
+        // デフォルト値：Q23.8
+        let q_format = QFormat::new(
+            q.unwrap_or(23),
+            int.unwrap_or(8)
+        ).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
 
         Ok(Self {
-            inner: FpgaAccelerator::new(4, DataConverter::new(format)),
-            converter: DataConverter::new(format),
+            inner: FpgaAccelerator::new(4, q_format)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
+            q_format,
         })
+    }
+
+    #[getter]
+    fn get_format(&self) -> PyResult<(u8, u8)> {
+        Ok((self.q_format.q, self.q_format.int))
     }
 
     #[pyo3(text_signature = "(self, matrix)")]
@@ -49,7 +54,7 @@ impl PyFpgaAccelerator {
             .map(|row| row.to_vec())
             .collect();
 
-        let fpga_matrix = Matrix::from_f32(&matrix_data, &self.converter)
+        let fpga_matrix = Matrix::from_f32(&matrix_data, self.q_format)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
 
         self.inner.prepare_matrix(&fpga_matrix)
@@ -64,7 +69,7 @@ impl PyFpgaAccelerator {
     ) -> PyResult<Py<PyArray1<f32>>> {
         let vector_data: Vec<f32> = vector.readonly().as_slice()?.to_vec();
         
-        let fpga_vector = Vector::from_f32(&vector_data, &self.converter)
+        let fpga_vector = Vector::from_f32(&vector_data, self.q_format)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
 
         let result = self.inner.compute_matrix_vector(&fpga_vector)
@@ -82,7 +87,7 @@ impl PyFpgaAccelerator {
         operation: &str
     ) -> PyResult<Py<PyArray1<f32>>> {
         let vector_data: Vec<f32> = vector.readonly().as_slice()?.to_vec();
-        let fpga_vector = Vector::from_f32(&vector_data, &self.converter)
+        let fpga_vector = Vector::from_f32(&vector_data, self.q_format)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
 
         let op = match operation {
@@ -96,6 +101,12 @@ impl PyFpgaAccelerator {
 
         let numpy_result: Vec<f32> = result.data.iter().map(|x| x.as_f32()).collect();
         Ok(numpy_result.to_pyarray(py).to_owned())
+    }
+
+    // フォーマット情報の文字列表現を返す
+    fn __str__(&self) -> PyResult<String> {
+        Ok(format!("Q{}.{} 固定小数点形式 FPGA アクセラレータ", 
+            self.q_format.q, self.q_format.int))
     }
 }
 

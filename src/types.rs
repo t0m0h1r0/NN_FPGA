@@ -1,4 +1,3 @@
-use std::ops::{Add, Mul};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -15,26 +14,48 @@ pub enum FpgaError {
 
 pub type Result<T> = std::result::Result<T, FpgaError>;
 
+// 固定小数点フォーマットの設定
 #[derive(Debug, Clone, Copy)]
-pub struct FixedPoint {
-    value: i32,
-    scale: u8,
+pub struct QFormat {
+    pub q: u8,      // 小数部ビット数
+    pub int: u8,    // 整数部ビット数
 }
 
-impl FixedPoint {
-    pub fn new(value: f32, scale: u8) -> Result<Self> {
-        if scale > 31 {
-            return Err(FpgaError::Configuration("スケールは31以下である必要があります".into()));
+impl QFormat {
+    pub fn new(q: u8, int: u8) -> Result<Self> {
+        // パラメータの検証
+        if !(16..=29).contains(&q) {
+            return Err(FpgaError::Configuration(
+                format!("小数部ビット数は16から29の間である必要があります: {}", q)
+            ));
         }
-        let scaled = (value * (1 << scale) as f32) as i32;
-        Ok(Self { value: scaled, scale })
+        if !(2..=12).contains(&int) {
+            return Err(FpgaError::Configuration(
+                format!("整数部ビット数は2から12の間である必要があります: {}", int)
+            ));
+        }
+        if q + int + 1 != 32 {
+            return Err(FpgaError::Configuration(
+                "総ビット数は32である必要があります".into()
+            ));
+        }
+
+        Ok(Self { q, int })
     }
 
-    pub fn to_f32(&self) -> f32 {
-        self.value as f32 / (1 << self.scale) as f32
+    // f32からの変換（切り捨て）
+    pub fn from_f32(&self, value: f32) -> i32 {
+        let scaled = value * (1 << self.q) as f32;
+        scaled as i32
+    }
+
+    // i32からf32への変換
+    pub fn to_f32(&self, value: i32) -> f32 {
+        value as f32 / (1 << self.q) as f32
     }
 }
 
+// 三値型
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrinaryValue {
     Zero,
@@ -43,96 +64,46 @@ pub enum TrinaryValue {
 }
 
 impl TrinaryValue {
-    pub fn from_f32(value: f32) -> Self {
-        match value {
-            v if v == 0.0 => TrinaryValue::Zero,
-            v if v > 0.0 => TrinaryValue::Plus,
-            _ => TrinaryValue::Minus,
+    pub fn to_i32(self) -> i32 {
+        match self {
+            TrinaryValue::Zero => 0b00,
+            TrinaryValue::Plus => 0b01,
+            TrinaryValue::Minus => 0b10,
         }
     }
 
-    pub fn to_f32(self) -> f32 {
-        match self {
-            TrinaryValue::Zero => 0.0,
-            TrinaryValue::Plus => 1.0,
-            TrinaryValue::Minus => -1.0,
+    pub fn from_i32(value: i32) -> Result<Self> {
+        match value & 0b11 {
+            0b00 => Ok(TrinaryValue::Zero),
+            0b01 => Ok(TrinaryValue::Plus),
+            0b10 => Ok(TrinaryValue::Minus),
+            _ => Err(FpgaError::TypeConversion("不正な三値".into())),
         }
     }
 }
 
+// 固定小数点値
 #[derive(Debug, Clone)]
-pub enum FpgaValue {
-    Float(f32),
-    Fixed(FixedPoint),
-    Trinary(TrinaryValue),
+pub struct FpgaValue {
+    pub value: i32,
+    pub format: QFormat,
 }
 
 impl FpgaValue {
+    // f32からの生成
+    pub fn from_f32(value: f32, format: QFormat) -> Self {
+        Self {
+            value: format.from_f32(value),
+            format,
+        }
+    }
+
+    // f32への変換
     pub fn as_f32(&self) -> f32 {
-        match self {
-            FpgaValue::Float(v) => *v,
-            FpgaValue::Fixed(v) => v.to_f32(),
-            FpgaValue::Trinary(v) => v.to_f32(),
-        }
+        self.format.to_f32(self.value)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum DataFormat {
-    Full,
-    Fixed { scale: u8 },
-    Trinary,
-}
-
-pub struct DataConverter {
-    format: DataFormat,
-}
-
-impl DataConverter {
-    pub fn new(format: DataFormat) -> Self {
-        Self { format }
-    }
-
-    pub fn convert(&self, value: f32) -> Result<FpgaValue> {
-        match self.format {
-            DataFormat::Full => Ok(FpgaValue::Float(value)),
-            DataFormat::Fixed { scale } => {
-                Ok(FpgaValue::Fixed(FixedPoint::new(value, scale)?))
-            }
-            DataFormat::Trinary => {
-                Ok(FpgaValue::Trinary(TrinaryValue::from_f32(value)))
-            }
-        }
-    }
-}
-
+// 行列の次元定数
 pub const MATRIX_SIZE: usize = 16;
 pub const VECTOR_SIZE: usize = 16;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_fixed_point_conversion() {
-        let fp = FixedPoint::new(0.5, 16).unwrap();
-        assert!((fp.to_f32() - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_trinary_conversion() {
-        assert_eq!(TrinaryValue::from_f32(1.5), TrinaryValue::Plus);
-        assert_eq!(TrinaryValue::from_f32(0.0), TrinaryValue::Zero);
-        assert_eq!(TrinaryValue::from_f32(-1.5), TrinaryValue::Minus);
-    }
-
-    #[test]
-    fn test_data_converter() {
-        let converter = DataConverter::new(DataFormat::Fixed { scale: 16 });
-        let value = converter.convert(0.5).unwrap();
-        match value {
-            FpgaValue::Fixed(fp) => assert!((fp.to_f32() - 0.5).abs() < 1e-6),
-            _ => panic!("Wrong type conversion"),
-        }
-    }
-}
